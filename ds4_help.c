@@ -227,6 +227,8 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dist-prefill-window N", "Max prefill chunks in flight. Default: workers+2, capped at 8.");
     opt(fp, c, "--dist-activation-bits N", "Hidden-state transport width: 32, 16, or 8. Default: 32");
     opt(fp, c, "--dist-replay-check", "Diagnostic: reset and replay prompt, then compare logits.");
+    opt(fp, c, "--dist-transport {tcp,rdma}", "Data-plane transport: tcp (default) or rdma (Thunderbolt 5).");
+    opt(fp, c, "--dist-rdma-device NAME", "RDMA device name (e.g. rdma_en3). Default: auto-detect.");
     opt(fp, c, "--debug", "Print coordinator route/debug logs.");
     fputc('\n', fp);
 }

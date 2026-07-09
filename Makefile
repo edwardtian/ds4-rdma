@@ -18,8 +18,12 @@ ROCM_SRCS := $(wildcard rocm/*.cuh)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+# Link librdma.tbd if the SDK has infiniband/verbs.h (macOS 26.2+)
+ifneq ($(shell test -f "$(shell xcrun --show-sdk-path 2>/dev/null)/usr/include/infiniband/verbs.h" && echo yes),)
+METAL_LDLIBS += -lrdma
+endif
+CORE_OBJS = ds4.o ds4_distributed.o ds4_dist_rdma.o ds4_ssd.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_dist_rdma.o ds4_ssd.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -155,8 +159,11 @@ ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
+ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h ds4_dist_transport.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
+
+ds4_dist_rdma.o: ds4_dist_rdma.c ds4_dist_transport.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_dist_rdma.c
 
 ds4_help.o: ds4_help.c ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_help.c

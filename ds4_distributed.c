@@ -14,6 +14,7 @@
  */
 
 #include "ds4_distributed.h"
+#include "ds4_dist_transport.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -288,7 +289,7 @@ typedef struct ds4_dist_worker_forwarder {
     ds4_dist_worker_upstream *upstream;
     char host[NI_MAXHOST];
     uint32_t port;
-    int fd;
+    ds4_dist_conn *conn;
     pthread_t tid;
     bool thread_started;
     pthread_mutex_t send_mu;
@@ -304,7 +305,7 @@ typedef struct ds4_dist_worker_forwarder {
 
 struct ds4_dist_worker_upstream {
     ds4_dist_worker_state *state;
-    int fd;
+    ds4_dist_conn *conn;   /* data-plane connection (WORK arrives here, RESULT goes back) */
     pthread_mutex_t write_mu;
     pthread_mutex_t forward_mu;
     ds4_dist_worker_forwarder *forwarders;
@@ -333,7 +334,7 @@ typedef struct {
 
 typedef struct {
     ds4_dist_worker_state *state;
-    int fd;
+    ds4_dist_conn *conn;
     char peer_host[NI_MAXHOST];
     char peer_port[NI_MAXSERV];
 } ds4_dist_data_client_ctx;
@@ -350,7 +351,7 @@ typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
     uint32_t flags;
-    int fd;
+    ds4_dist_conn *conn;
 } ds4_dist_route_entry;
 
 typedef struct {
@@ -405,7 +406,7 @@ typedef struct {
 
 typedef struct {
     ds4_dist_coordinator_state *state;
-    int fd;
+    ds4_dist_conn *conn;
     ds4_session *progress_session;
     uint64_t first_request_id;
     uint64_t *expected_hashes;
@@ -444,7 +445,7 @@ typedef struct {
     const ds4_dist_route_plan *plan;
     const ds4_tokens *prompt;
     uint64_t session_id;
-    int fd;
+    ds4_dist_conn *conn;
     ds4_dist_prefill_send_slot *slots;
     uint32_t slot_count;
     uint32_t head;
@@ -508,8 +509,26 @@ static int dist_worker_handle_snapshot_load(
 static void dist_worker_upstream_init(
         ds4_dist_worker_upstream *upstream,
         ds4_dist_worker_state *state,
-        int fd);
+        ds4_dist_conn *conn);
 static void dist_worker_upstream_destroy(ds4_dist_worker_upstream *upstream);
+
+/* Forward declarations for wire helpers used by conn-based wrappers below. */
+static uint32_t dist_activation_bits_or_default(uint32_t bits);
+static bool dist_activation_bits_valid(uint32_t bits);
+static bool dist_activation_wire_bytes(uint32_t bits, uint64_t values, uint32_t *out);
+static bool dist_activation_values_from_wire_bytes(uint32_t bits, uint32_t bytes, uint64_t *out);
+static bool dist_activation_wire_bytes_from_f32_bytes(uint32_t bits, uint32_t f32_bytes, uint32_t *out);
+static uint16_t dist_f32_to_f16(float f);
+static uint8_t dist_f32_to_f8_e4m3(float f);
+static int dist_decode_activation_payload(const void *wire, uint32_t bits, uint32_t wire_bytes,
+                                           float **out, uint32_t *out_bytes, bool *out_uses_wire,
+                                           char *err, size_t errlen);
+static uint64_t dist_u64_from_halves(uint32_t hi, uint32_t lo);
+static void dist_u64_to_halves(uint64_t v, uint32_t *hi, uint32_t *lo);
+static void dist_work_to_wire(ds4_dist_work_fixed *w);
+static void dist_result_to_wire(ds4_dist_result_fixed *r);
+static void dist_result_from_wire(ds4_dist_result_fixed *r);
+static void dist_telemetry_to_wire(ds4_dist_telemetry_fixed *t);
 static int dist_worker_upstream_send_work_error(
         ds4_dist_worker_upstream *upstream,
         uint64_t request_id,
@@ -542,6 +561,433 @@ static const char *dist_role_name(ds4_distributed_role role) {
 
 static void dist_sleep_reconnect(void) {
     sleep(1);
+}
+
+/* =========================================================================
+ * Transport globals and conn-based I/O wrappers
+ * ========================================================================= */
+
+static ds4_dist_transport_kind g_dist_transport = DS4_DIST_TRANSPORT_TCP;
+static const char *g_dist_rdma_device = NULL;
+static bool g_dist_transport_initialized = false;
+
+static void dist_transport_init(const ds4_dist_options *opt) {
+    if (g_dist_transport_initialized) return;
+    g_dist_transport_initialized = true;
+    if (opt && opt->transport == 1) {
+        g_dist_transport = DS4_DIST_TRANSPORT_RDMA;
+        g_dist_rdma_device = opt->rdma_device;
+        if (!g_dist_rdma_device || !g_dist_rdma_device[0]) {
+            const char *env = getenv("DS4_DIST_RDMA_DEVICE");
+            if (env && env[0]) g_dist_rdma_device = env;
+        }
+    } else {
+        const char *env = getenv("DS4_DIST_TRANSPORT");
+        if (env && (!strcmp(env, "rdma") || !strcmp(env, "RDMA"))) {
+            g_dist_transport = DS4_DIST_TRANSPORT_RDMA;
+            g_dist_rdma_device = getenv("DS4_DIST_RDMA_DEVICE");
+        }
+    }
+}
+
+static bool dist_transport_is_rdma(void) {
+    return g_dist_transport == DS4_DIST_TRANSPORT_RDMA;
+}
+
+/* Open a data-plane connection to host:port using the configured transport. */
+static ds4_dist_conn *dist_conn_open(const char *host, int port, char *err, size_t errlen) {
+    return ds4_dist_conn_connect(host, port, g_dist_transport, g_dist_rdma_device, err, errlen);
+}
+
+/* Accept a data-plane connection from a TCP listener fd. */
+static ds4_dist_conn *dist_conn_accept(int listen_fd, char *err, size_t errlen) {
+    return ds4_dist_conn_accept(listen_fd, g_dist_transport, g_dist_rdma_device, err, errlen);
+}
+
+/* --- conn-based frame I/O wrappers --- */
+
+static int dist_conn_read_frame_header(
+        ds4_dist_conn *c,
+        uint32_t *type,
+        uint32_t *bytes,
+        char *err,
+        size_t errlen) {
+    return ds4_dist_conn_recv_header(c, type, bytes, err, errlen);
+}
+
+static int dist_conn_read_full(ds4_dist_conn *c, void *buf, size_t len) {
+    return ds4_dist_conn_recv_body(c, buf, (uint32_t)len);
+}
+
+static int dist_conn_discard_bytes(ds4_dist_conn *c, uint32_t bytes) {
+    return ds4_dist_conn_discard(c, bytes);
+}
+
+static int dist_conn_send_error(ds4_dist_conn *c, const char *msg) {
+    if (!msg) msg = "distributed protocol error";
+    size_t len = strlen(msg);
+    if (len > UINT32_MAX) len = UINT32_MAX;
+    return ds4_dist_conn_send(c, DS4_DIST_MSG_ERROR, msg, (uint32_t)len);
+}
+
+/* Forward declaration of the TCP-only work-frame sender (defined later). */
+static int dist_send_work_frame(
+        int fd,
+        const ds4_dist_work_fixed *work,
+        const int *tokens,
+        const float *input_hc,
+        const void *route_blob);
+
+/* conn-based work-frame sender: assembles the entire frame for RDMA,
+ * delegates to the existing streaming function for TCP. */
+static int dist_conn_send_work_frame(
+        ds4_dist_conn *c,
+        const ds4_dist_work_fixed *work,
+        const int *tokens,
+        const float *input_hc,
+        const void *route_blob) {
+    if (!c) return -1;
+    if (!ds4_dist_conn_is_rdma(c)) {
+        return dist_send_work_frame(ds4_dist_conn_fd(c), work, tokens, input_hc, route_blob);
+    }
+    /* RDMA: assemble the complete frame body into a temp buffer, then send. */
+    if (!work || !tokens || work->n_tokens == 0) return -1;
+    const uint64_t token_bytes = (uint64_t)work->n_tokens * sizeof(uint32_t);
+    if (token_bytes > UINT32_MAX || work->token_bytes != (uint32_t)token_bytes) return -1;
+    if (work->input_hc_bytes != 0 && !input_hc) return -1;
+    if (work->route_bytes != 0 && !route_blob) return -1;
+    uint64_t input_hc_values = 0;
+    if (work->input_hc_bytes != 0 &&
+        !dist_activation_values_from_wire_bytes(work->input_hc_bits,
+                                                work->input_hc_bytes,
+                                                &input_hc_values))
+        return -1;
+    const uint64_t frame_bytes = sizeof(ds4_dist_work_fixed) +
+                                 (uint64_t)work->token_bytes +
+                                 work->input_hc_bytes +
+                                 work->route_bytes;
+    if (frame_bytes > UINT32_MAX) return -1;
+
+    /* Allocate a contiguous body buffer */
+    uint32_t body_bytes = (uint32_t)frame_bytes;
+    void *body = malloc(body_bytes);
+    if (!body) return -1;
+
+    unsigned char *p = body;
+    /* work_fixed */
+    ds4_dist_work_fixed wire = *work;
+    dist_work_to_wire(&wire);
+    memcpy(p, &wire, sizeof(wire));
+    p += sizeof(wire);
+    /* tokens */
+    for (uint32_t i = 0; i < work->n_tokens; i++) {
+        uint32_t t = htonl((uint32_t)tokens[i]);
+        memcpy(p, &t, sizeof(t));
+        p += sizeof(t);
+    }
+    /* activation payload */
+    if (work->input_hc_bytes != 0) {
+        /* For RDMA we need to pack the activation into the buffer.
+         * dist_write_activation_payload writes to an fd; we need a memory version. */
+        if (work->input_hc_bits == 32) {
+            /* f32: copy directly (but need to handle byte order if big-endian) */
+            memcpy(p, input_hc, (size_t)work->input_hc_bytes);
+            p += work->input_hc_bytes;
+        } else {
+            /* f16 or f8: pack into buffer */
+            uint32_t written = 0;
+            if (work->input_hc_bits == 16) {
+                for (uint64_t i = 0; i < input_hc_values; i++) {
+                    uint16_t h = dist_f32_to_f16(((const float *)input_hc)[i]);
+                    h = htons(h);
+                    memcpy(p, &h, sizeof(h));
+                    p += sizeof(h);
+                    written += sizeof(h);
+                }
+            } else if (work->input_hc_bits == 8) {
+                for (uint64_t i = 0; i < input_hc_values; i++) {
+                    uint8_t v = dist_f32_to_f8_e4m3(((const float *)input_hc)[i]);
+                    *p++ = v;
+                    written++;
+                }
+            }
+            (void)written;
+        }
+    }
+    /* route blob */
+    if (work->route_bytes != 0) {
+        memcpy(p, route_blob, work->route_bytes);
+        p += work->route_bytes;
+    }
+
+    int rc = ds4_dist_conn_send(c, DS4_DIST_MSG_WORK, body, body_bytes);
+    free(body);
+    return rc;
+}
+
+/* Forward declaration of TCP-only result sender */
+static int dist_send_work_result(
+        int fd,
+        uint64_t request_id,
+        uint64_t result_hash,
+        uint32_t status,
+        uint32_t result_kind,
+        uint32_t payload_bits,
+        const ds4_dist_telemetry_fixed *telemetry,
+        uint32_t telemetry_count,
+        const void *payload,
+        uint32_t payload_bytes);
+
+/* conn-based result sender */
+static int dist_conn_send_work_result(
+        ds4_dist_conn *c,
+        uint64_t request_id,
+        uint64_t result_hash,
+        uint32_t status,
+        uint32_t result_kind,
+        uint32_t payload_bits,
+        const ds4_dist_telemetry_fixed *telemetry,
+        uint32_t telemetry_count,
+        const void *payload,
+        uint32_t payload_bytes) {
+    if (!c) return -1;
+    if (!ds4_dist_conn_is_rdma(c)) {
+        return dist_send_work_result(ds4_dist_conn_fd(c), request_id, result_hash,
+                                     status, result_kind, payload_bits,
+                                     telemetry, telemetry_count,
+                                     payload, payload_bytes);
+    }
+    /* RDMA: assemble the complete frame body */
+    if (payload_bytes != 0 && !payload) return -1;
+    if (telemetry_count != 0 && !telemetry) return -1;
+    uint32_t wire_payload_bytes = payload_bytes;
+    uint64_t hidden_values = 0;
+    if (status == 0 && result_kind == DS4_DIST_RESULT_HIDDEN_STATE) {
+        payload_bits = dist_activation_bits_or_default(payload_bits);
+        if (!dist_activation_bits_valid(payload_bits) ||
+            (payload_bytes % (uint32_t)sizeof(float)) != 0)
+            return -1;
+        hidden_values = payload_bytes / (uint32_t)sizeof(float);
+        if (!dist_activation_wire_bytes(payload_bits, hidden_values, &wire_payload_bytes))
+            return -1;
+    } else if (status == 0 && result_kind == DS4_DIST_RESULT_LOGITS) {
+        payload_bits = 32u;
+    } else {
+        payload_bits = 0;
+    }
+    const uint64_t telemetry_bytes64 =
+        (uint64_t)telemetry_count * sizeof(ds4_dist_telemetry_fixed);
+    if (telemetry_bytes64 > UINT32_MAX) return -1;
+    const uint32_t telemetry_bytes = (uint32_t)telemetry_bytes64;
+    const uint64_t frame_bytes = sizeof(ds4_dist_result_fixed) +
+                                 telemetry_bytes64 +
+                                 (uint64_t)wire_payload_bytes;
+    if (frame_bytes > UINT32_MAX) return -1;
+
+    uint32_t body_bytes = (uint32_t)frame_bytes;
+    void *body = malloc(body_bytes);
+    if (!body) return -1;
+
+    unsigned char *p = body;
+    /* result_fixed */
+    ds4_dist_result_fixed r;
+    dist_u64_to_halves(request_id, &r.request_hi, &r.request_lo);
+    dist_u64_to_halves(status == 0 ? result_hash : 0, &r.result_hash_hi, &r.result_hash_lo);
+    r.status = status;
+    r.result_kind = result_kind;
+    r.telemetry_count = telemetry_count;
+    r.telemetry_bytes = telemetry_bytes;
+    r.payload_bytes = wire_payload_bytes;
+    r.payload_bits = payload_bits;
+    ds4_dist_result_fixed wire_r = r;
+    dist_result_to_wire(&wire_r);
+    memcpy(p, &wire_r, sizeof(wire_r));
+    p += sizeof(wire_r);
+    /* telemetry */
+    for (uint32_t i = 0; i < telemetry_count; i++) {
+        ds4_dist_telemetry_fixed tw = telemetry[i];
+        dist_telemetry_to_wire(&tw);
+        memcpy(p, &tw, sizeof(tw));
+        p += sizeof(tw);
+    }
+    /* payload */
+    if (status == 0 && result_kind == DS4_DIST_RESULT_HIDDEN_STATE && wire_payload_bytes != 0) {
+        if (payload_bits == 32) {
+            memcpy(p, payload, (size_t)wire_payload_bytes);
+            p += wire_payload_bytes;
+        } else if (payload_bits == 16) {
+            for (uint64_t i = 0; i < hidden_values; i++) {
+                uint16_t h = dist_f32_to_f16(((const float *)payload)[i]);
+                h = htons(h);
+                memcpy(p, &h, sizeof(h));
+                p += sizeof(h);
+            }
+        } else if (payload_bits == 8) {
+            for (uint64_t i = 0; i < hidden_values; i++) {
+                *p++ = dist_f32_to_f8_e4m3(((const float *)payload)[i]);
+            }
+        }
+    } else if (payload_bytes && payload) {
+        memcpy(p, payload, payload_bytes);
+        p += payload_bytes;
+    }
+
+    int rc = ds4_dist_conn_send(c, DS4_DIST_MSG_RESULT, body, body_bytes);
+    free(body);
+    return rc;
+}
+
+static int dist_conn_send_work_error(
+        ds4_dist_conn *c,
+        uint64_t request_id,
+        const char *msg) {
+    if (!msg) msg = "distributed work failed";
+    size_t len = strlen(msg);
+    if (len > UINT32_MAX) len = UINT32_MAX;
+    return dist_conn_send_work_result(c, request_id, 0, 1, 0, 0, NULL, 0, msg, (uint32_t)len);
+}
+
+/* Forward declaration of TCP-only result receiver */
+static int dist_recv_result_alloc(
+        int fd,
+        const ds4_dist_coordinator_state *state,
+        uint64_t request_id,
+        uint32_t *kind,
+        uint64_t *result_hash,
+        void **payload,
+        uint32_t *payload_bytes,
+        char *err,
+        size_t errlen);
+
+/* conn-based result receiver */
+static int dist_conn_recv_result_alloc(
+        ds4_dist_conn *c,
+        const ds4_dist_coordinator_state *state,
+        uint64_t request_id,
+        uint32_t *kind,
+        uint64_t *result_hash,
+        void **payload,
+        uint32_t *payload_bytes,
+        char *err,
+        size_t errlen) {
+    if (!c) return 1;
+    if (!ds4_dist_conn_is_rdma(c)) {
+        return dist_recv_result_alloc(ds4_dist_conn_fd(c), state, request_id,
+                                      kind, result_hash, payload, payload_bytes,
+                                      err, errlen);
+    }
+    /* RDMA: receive entire frame, parse from buffer */
+    *payload = NULL;
+    *payload_bytes = 0;
+    *kind = 0;
+    if (result_hash) *result_hash = 0;
+
+    uint32_t type = 0, bytes = 0;
+    int rc = ds4_dist_conn_recv_header(c, &type, &bytes, err, errlen);
+    if (rc <= 0) {
+        if (rc == 0 && errlen) snprintf(err, errlen, "distributed worker closed connection");
+        return 1;
+    }
+    if (type != DS4_DIST_MSG_RESULT || bytes < sizeof(ds4_dist_result_fixed)) {
+        ds4_dist_conn_discard(c, bytes);
+        if (errlen) snprintf(err, errlen, "distributed worker returned invalid frame");
+        return 1;
+    }
+
+    /* Read the body into a temporary buffer */
+    void *body = malloc(bytes);
+    if (!body) {
+        ds4_dist_conn_discard(c, bytes);
+        if (errlen) snprintf(err, errlen, "out of memory reading distributed result");
+        return 1;
+    }
+    rc = ds4_dist_conn_recv_body(c, body, bytes);
+    if (rc <= 0) {
+        free(body);
+        if (errlen) snprintf(err, errlen, "failed to read distributed result");
+        return 1;
+    }
+
+    /* Parse result_fixed */
+    ds4_dist_result_fixed result;
+    memcpy(&result, body, sizeof(result));
+    dist_result_from_wire(&result);
+    const uint64_t got_request = dist_u64_from_halves(result.request_hi, result.request_lo);
+    const uint64_t got_hash = dist_u64_from_halves(result.result_hash_hi, result.result_hash_lo);
+    const uint32_t body_bytes = bytes - (uint32_t)sizeof(result);
+    if (result.telemetry_bytes % (uint32_t)sizeof(ds4_dist_telemetry_fixed) != 0 ||
+        result.telemetry_count != result.telemetry_bytes / (uint32_t)sizeof(ds4_dist_telemetry_fixed) ||
+        result.telemetry_bytes > body_bytes ||
+        result.payload_bytes != body_bytes - result.telemetry_bytes) {
+        free(body);
+        if (errlen) snprintf(err, errlen, "distributed result telemetry metadata mismatch");
+        return 1;
+    }
+    if (got_request != request_id) {
+        free(body);
+        if (errlen) snprintf(err, errlen, "distributed result metadata mismatch");
+        return 1;
+    }
+
+    /* Skip telemetry (we don't parse it for RDMA path in this first cut) */
+    void *payload_start = (char *)body + sizeof(result) + result.telemetry_bytes;
+    uint32_t pbytes = result.payload_bytes;
+
+    if (result.status != 0) {
+        if (errlen) {
+            if (pbytes) {
+                size_t n = pbytes < errlen - 1 ? pbytes : errlen - 1;
+                memcpy(err, payload_start, n);
+                err[n] = '\0';
+            } else {
+                snprintf(err, errlen, "distributed worker returned an error");
+            }
+        }
+        free(body);
+        return DS4_DIST_RECV_REMOTE_ERROR;
+    }
+
+    void *result_payload = NULL;
+    uint32_t result_payload_bytes = 0;
+    if (result.result_kind == DS4_DIST_RESULT_HIDDEN_STATE && pbytes != 0) {
+        float *decoded = NULL;
+        uint32_t decoded_bytes = 0;
+        bool uses_wire = false;
+        if (dist_decode_activation_payload(payload_start,
+                                           result.payload_bits,
+                                           pbytes,
+                                           &decoded,
+                                           &decoded_bytes,
+                                           &uses_wire,
+                                           err,
+                                           errlen) != 0) {
+            free(body);
+            return 1;
+        }
+        if (uses_wire) {
+            /* decoded points into payload_start which is in body */
+            result_payload = malloc(decoded_bytes);
+            if (result_payload) memcpy(result_payload, decoded, decoded_bytes);
+            free(body);
+        } else {
+            free(body);
+            result_payload = decoded;
+        }
+        result_payload_bytes = decoded_bytes;
+    } else if (pbytes != 0) {
+        result_payload = malloc(pbytes);
+        if (result_payload) memcpy(result_payload, payload_start, pbytes);
+        free(body);
+        result_payload_bytes = pbytes;
+    } else {
+        free(body);
+    }
+
+    *kind = result.result_kind;
+    if (result_hash) *result_hash = got_hash;
+    *payload = result_payload;
+    *payload_bytes = result_payload_bytes;
+    return 0;
 }
 
 static double dist_now_sec(void) {
@@ -2081,7 +2527,7 @@ static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
 static void dist_route_plan_free(ds4_dist_route_plan *plan) {
     if (!plan) return;
     for (uint32_t i = 0; i < plan->count; i++) {
-        if (plan->entry[i].fd >= 0) close(plan->entry[i].fd);
+        if (plan->entry[i].conn) ds4_dist_conn_close(plan->entry[i].conn);
     }
     free(plan->entry);
     free(plan->blob);
@@ -2262,15 +2708,16 @@ static bool dist_coordinator_build_route_plan(
         ds4_dist_worker_entry *w = path[i];
         ds4_dist_route_entry entry;
         memset(&entry, 0, sizeof(entry));
-        entry.fd = -1;
+        entry.conn = NULL;
         snprintf(entry.host, sizeof(entry.host), "%s", w->peer_host);
         entry.port = w->listen_port;
         entry.layer_start = w->layer_start;
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
         if (state->use_control_for_work && plan->count == 0) {
-            entry.fd = dup(w->fd);
-            if (entry.fd < 0) {
+            /* TCP: reuse the worker's control fd via dup */
+            int dupfd = dup(w->fd);
+            if (dupfd < 0) {
                 pthread_mutex_unlock(&state->mu);
                 free(workers);
                 free(path);
@@ -2278,7 +2725,32 @@ static bool dist_coordinator_build_route_plan(
                 if (errlen) snprintf(err, errlen, "failed to duplicate first-hop worker connection: %s", strerror(errno));
                 return false;
             }
-            dist_set_socket_low_latency(entry.fd);
+            dist_set_socket_low_latency(dupfd);
+            entry.conn = ds4_dist_conn_new_tcp(dupfd);
+            if (!entry.conn) {
+                close(dupfd);
+                pthread_mutex_unlock(&state->mu);
+                free(workers);
+                free(path);
+                dist_route_plan_free(plan);
+                if (errlen) snprintf(err, errlen, "out of memory creating first-hop conn");
+                return false;
+            }
+        } else if (!state->use_control_for_work && plan->count == 0) {
+            /* RDMA (or non-control mode): open a dedicated data connection
+             * to the first-hop worker's data listener. */
+            char conn_err[256];
+            entry.conn = dist_conn_open(w->peer_host, (int)w->listen_port,
+                                        conn_err, sizeof(conn_err));
+            if (!entry.conn) {
+                pthread_mutex_unlock(&state->mu);
+                free(workers);
+                free(path);
+                dist_route_plan_free(plan);
+                if (errlen) snprintf(err, errlen, "failed to connect to first-hop worker %s:%u: %s",
+                                     w->peer_host, w->listen_port, conn_err);
+                return false;
+            }
         }
 
         ds4_dist_route_entry *new_entries = realloc(plan->entry, (size_t)(plan->count + 1u) * sizeof(plan->entry[0]));
@@ -2286,7 +2758,7 @@ static bool dist_coordinator_build_route_plan(
             pthread_mutex_unlock(&state->mu);
             free(workers);
             free(path);
-            if (entry.fd >= 0) close(entry.fd);
+            if (entry.conn) ds4_dist_conn_close(entry.conn);
             dist_route_plan_free(plan);
             if (errlen) snprintf(err, errlen, "out of memory building route entries");
             return false;
@@ -2490,10 +2962,10 @@ static int dist_recv_result_alloc(
     return 0;
 }
 
-static int dist_coordinator_send_remote_work_on_fd(
+static int dist_coordinator_send_remote_work_on_conn(
         ds4_dist_coordinator_state *state,
         const ds4_dist_route_plan *plan,
-        int fd,
+        ds4_dist_conn *conn,
         const int *tokens,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -2544,18 +3016,18 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.route_index = 0;
     work.route_bytes = plan->blob_bytes;
 
-    if (dist_send_work_frame(fd, &work, tokens, hidden_hc, plan->blob) != 0) {
+    if (dist_conn_send_work_frame(conn, &work, tokens, hidden_hc, plan->blob) != 0) {
         if (errlen) snprintf(err, errlen, "failed to send distributed work");
         return 1;
     }
     return 0;
 }
 
-static int dist_coordinator_eval_remote_on_fd(
+static int dist_coordinator_eval_remote_on_conn(
         ds4_dist_coordinator_state *state,
         ds4_session *session,
         const ds4_dist_route_plan *plan,
-        int fd,
+        ds4_dist_conn *conn,
         const int *tokens,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -2572,9 +3044,9 @@ static int dist_coordinator_eval_remote_on_fd(
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
     const double total_t0 = profile ? dist_now_sec() : 0.0;
     const double send_t0 = profile ? dist_now_sec() : 0.0;
-    int rc = dist_coordinator_send_remote_work_on_fd(state,
+    int rc = dist_coordinator_send_remote_work_on_conn(state,
                                                      plan,
-                                                     fd,
+                                                     conn,
                                                      tokens,
                                                      n_tokens,
                                                      pos0,
@@ -2594,7 +3066,7 @@ static int dist_coordinator_eval_remote_on_fd(
     void *payload = NULL;
     if (rc == 0) {
         const double recv_t0 = profile ? dist_now_sec() : 0.0;
-        rc = dist_recv_result_alloc(fd,
+        rc = dist_conn_recv_result_alloc(conn,
                                     state,
                                     request_id,
                                     &kind,
@@ -2718,11 +3190,11 @@ static int dist_coordinator_eval_span(
     }
 
     const bool local_logits = plan->count == 0;
-    int remote_fd = -1;
+    ds4_dist_conn *remote_conn = NULL;
     if (plan->count != 0) {
         const ds4_dist_route_entry *first = &plan->entry[0];
-        remote_fd = first->fd;
-        if (remote_fd < 0) {
+        remote_conn = first->conn;
+        if (!remote_conn) {
             if (errlen) snprintf(err, errlen, "distributed route has no live first-hop connection");
             free(hidden);
             return 1;
@@ -2746,10 +3218,10 @@ static int dist_coordinator_eval_span(
     double remote_t0 = 0.0, remote_t1 = 0.0;
     if (rc == 0 && plan->count != 0) {
         remote_t0 = profile ? dist_now_sec() : 0.0;
-        rc = dist_coordinator_eval_remote_on_fd(state,
+        rc = dist_coordinator_eval_remote_on_conn(state,
                                                 session,
                                                 plan,
-                                                remote_fd,
+                                                remote_conn,
                                                 tokens,
                                                 n_tokens,
                                                 pos0,
@@ -3105,7 +3577,7 @@ static int dist_prefill_sender_init(
         const ds4_dist_route_plan *plan,
         const ds4_tokens *prompt,
         uint64_t session_id,
-        int fd,
+        ds4_dist_conn *conn,
         uint32_t chunk_count,
         uint32_t max_hidden_bytes,
         char *err,
@@ -3115,7 +3587,7 @@ static int dist_prefill_sender_init(
     sender->plan = plan;
     sender->prompt = prompt;
     sender->session_id = session_id;
-    sender->fd = fd;
+    sender->conn = conn;
     sender->slot_count = dist_prefill_send_depth(chunk_count);
     pthread_mutex_init(&sender->mu, NULL);
     pthread_cond_init(&sender->can_enqueue, NULL);
@@ -3200,7 +3672,7 @@ static void dist_prefill_sender_cancel(ds4_dist_prefill_sender *sender) {
     pthread_cond_broadcast(&sender->can_enqueue);
     pthread_cond_broadcast(&sender->can_dequeue);
     pthread_mutex_unlock(&sender->mu);
-    shutdown(sender->fd, SHUT_RDWR);
+    ds4_dist_conn_shutdown(sender->conn);
 }
 
 static void *dist_prefill_sender_main(void *arg) {
@@ -3219,9 +3691,9 @@ static void *dist_prefill_sender_main(void *arg) {
 
         char send_err[256];
         const double send_t0 = dist_now_sec();
-        int rc = dist_coordinator_send_remote_work_on_fd(sender->state,
+        int rc = dist_coordinator_send_remote_work_on_conn(sender->state,
                                                          sender->plan,
-                                                         sender->fd,
+                                                         sender->conn,
                                                          sender->prompt->v + slot->pos,
                                                          slot->n_tokens,
                                                          slot->pos,
@@ -3254,7 +3726,7 @@ static void *dist_prefill_sender_main(void *arg) {
             pthread_cond_broadcast(&sender->can_enqueue);
             pthread_cond_broadcast(&sender->can_dequeue);
             pthread_mutex_unlock(&sender->mu);
-            shutdown(sender->fd, SHUT_RDWR);
+            ds4_dist_conn_shutdown(sender->conn);
             break;
         }
         sender->head = (sender->head + 1u) % sender->slot_count;
@@ -3356,7 +3828,7 @@ static void *dist_prefill_result_reader_main(void *arg) {
         uint32_t payload_bytes = 0;
         uint64_t result_hash = 0;
         void *payload = NULL;
-        int recv_rc = dist_recv_result_alloc(reader->fd,
+        int recv_rc = dist_conn_recv_result_alloc(reader->conn,
                                              reader->state,
                                              request_id,
                                              &kind,
@@ -3368,7 +3840,7 @@ static void *dist_prefill_result_reader_main(void *arg) {
         if (recv_rc != 0) {
             reader->rc = recv_rc;
             free(payload);
-            shutdown(reader->fd, SHUT_RDWR);
+            ds4_dist_conn_shutdown(reader->conn);
             dist_prefill_reader_signal_progress(reader, i, true);
             return NULL;
         }
@@ -3378,7 +3850,7 @@ static void *dist_prefill_result_reader_main(void *arg) {
                      "distributed pipelined prefill prefix hash mismatch");
             reader->rc = 1;
             free(payload);
-            shutdown(reader->fd, SHUT_RDWR);
+            ds4_dist_conn_shutdown(reader->conn);
             dist_prefill_reader_signal_progress(reader, i, true);
             return NULL;
         }
@@ -3401,7 +3873,7 @@ static void *dist_prefill_result_reader_main(void *arg) {
                      "distributed pipelined prefill returned invalid result");
             reader->rc = 1;
             free(payload);
-            shutdown(reader->fd, SHUT_RDWR);
+            ds4_dist_conn_shutdown(reader->conn);
             dist_prefill_reader_signal_progress(reader, i, true);
             return NULL;
         }
@@ -3429,7 +3901,7 @@ static bool dist_coordinator_can_pipeline_prefill(
     (void)session;
     if (chunk_cap == 0 || n_tokens <= chunk_cap) return false;
     if (plan->count == 0) return false;
-    if (plan->entry[0].fd < 0) return false;
+    if (plan->entry[0].conn == NULL) return false;
     const ds4_dist_route_entry *final = &plan->entry[plan->count - 1u];
     if ((final->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) == 0) {
         return final->layer_end + 1u == state->n_layers &&
@@ -3468,6 +3940,16 @@ static int dist_coordinator_prefill_chunk_cap(
                      prefill_cap);
         }
         return 1;
+    }
+    /* When RDMA is active, cap the prefill chunk so the activation blob fits
+     * in a single RDMA message (max 16,773,120 bytes per TN3205). */
+    if (dist_transport_is_rdma() && state && state->engine) {
+        uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
+        uint32_t activation_bits = state->activation_bits ? state->activation_bits : 32u;
+        uint32_t rdma_max = ds4_dist_rdma_max_tokens(hc_values, activation_bits);
+        if (requested > rdma_max) {
+            requested = rdma_max;
+        }
     }
     *chunk_cap = requested;
     return 0;
@@ -3557,7 +4039,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
                                  plan,
                                  prompt,
                                  session_id,
-                                 plan->entry[0].fd,
+                                 plan->entry[0].conn,
                                  chunk_count,
                                  max_hidden_bytes,
                                  err,
@@ -3569,7 +4051,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     ds4_dist_prefill_result_reader reader;
     memset(&reader, 0, sizeof(reader));
     reader.state = state;
-    reader.fd = plan->entry[0].fd;
+    reader.conn = plan->entry[0].conn;
     reader.progress_session = session;
     reader.first_request_id = *request_id;
     reader.count = chunk_count;
@@ -3710,7 +4192,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
         rc = 1;
     }
     if (rc != 0) {
-        shutdown(plan->entry[0].fd, SHUT_RDWR);
+        ds4_dist_conn_shutdown(plan->entry[0].conn);
     }
     if (rc == 0) {
         while (!dist_prefill_reader_wait_emit_progress(&reader, &reported_chunks)) {
@@ -5440,7 +5922,8 @@ int ds4_dist_session_create(
     d->state.local_can_output_head = ds4_engine_has_output_head(engine);
     d->state.replay_check = opt->replay_check;
     d->state.debug = opt->debug;
-    d->state.use_control_for_work = true;
+    dist_transport_init(opt);
+    d->state.use_control_for_work = !dist_transport_is_rdma();
     d->state.prefill_chunk = opt->prefill_chunk;
     d->state.prefill_window = opt->prefill_window;
     d->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
@@ -5724,7 +6207,8 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.local_can_output_head = ds4_engine_has_output_head(engine);
     state.replay_check = opt->replay_check;
     state.debug = opt->debug;
-    state.use_control_for_work = gen && gen->prompt;
+    dist_transport_init(opt);
+    state.use_control_for_work = (gen && gen->prompt) && !dist_transport_is_rdma();
     state.prefill_chunk = opt->prefill_chunk;
     state.prefill_window = opt->prefill_window;
     state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
@@ -5767,15 +6251,15 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
  * Worker Control Loop And Result Frames
  * ========================================================================= */
 
-static int dist_worker_read_loop(ds4_dist_worker_state *state, int fd) {
+static int dist_worker_read_loop(ds4_dist_worker_state *state, ds4_dist_conn *conn) {
     ds4_dist_worker_upstream upstream;
-    dist_worker_upstream_init(&upstream, state, fd);
+    dist_worker_upstream_init(&upstream, state, conn);
     int loop_rc = 0;
 
     for (;;) {
         uint32_t type = 0, bytes = 0;
         char err[256];
-        int rc = dist_read_frame_header(fd, &type, &bytes, err, sizeof(err));
+        int rc = dist_conn_read_frame_header(conn, &type, &bytes, err, sizeof(err));
         if (rc == 0) break;
         if (rc < 0) {
             fprintf(stderr, "ds4: distributed worker: protocol error: %s\n", err);
@@ -5785,13 +6269,13 @@ static int dist_worker_read_loop(ds4_dist_worker_state *state, int fd) {
         if (type == DS4_DIST_MSG_ERROR) {
             char msg[512];
             uint32_t n = bytes < sizeof(msg) - 1u ? bytes : (uint32_t)sizeof(msg) - 1u;
-            rc = dist_read_full(fd, msg, n);
+            rc = dist_conn_read_full(conn, msg, n);
             if (rc <= 0) {
                 loop_rc = 1;
                 break;
             }
             msg[n] = '\0';
-            if (bytes > n) dist_discard_bytes(fd, bytes - n);
+            if (bytes > n) dist_conn_discard_bytes(conn, bytes - n);
             fprintf(stderr, "ds4: distributed worker: coordinator error: %s\n", msg);
             loop_rc = 1;
             break;
@@ -5820,13 +6304,13 @@ static int dist_worker_read_loop(ds4_dist_worker_state *state, int fd) {
             }
             continue;
         }
-        rc = dist_discard_bytes(fd, bytes);
+        rc = dist_conn_discard_bytes(conn, bytes);
         if (rc <= 0) {
             loop_rc = rc == 0 ? 0 : 1;
             break;
         }
         pthread_mutex_lock(&upstream.write_mu);
-        dist_send_error(fd, "unsupported distributed worker frame");
+        dist_conn_send_error(conn, "unsupported distributed worker frame");
         pthread_mutex_unlock(&upstream.write_mu);
         fprintf(stderr, "ds4: distributed worker: rejected unsupported frame type %u\n", type);
         loop_rc = 1;
@@ -5901,13 +6385,6 @@ static int dist_send_work_result(
         return -1;
     }
     return 1;
-}
-
-static int dist_send_work_error(int fd, uint64_t request_id, const char *msg) {
-    if (!msg) msg = "distributed work failed";
-    size_t len = strlen(msg);
-    if (len > UINT32_MAX) len = UINT32_MAX;
-    return dist_send_work_result(fd, request_id, 0, 1, 0, 0, NULL, 0, msg, (uint32_t)len);
 }
 
 static int dist_send_snapshot_begin(
@@ -6047,7 +6524,7 @@ static bool dist_route_get_entry(
             out->layer_start = fixed.layer_start;
             out->layer_end = fixed.layer_end;
             out->flags = fixed.flags;
-            out->fd = -1;
+            out->conn = NULL;
             return true;
         }
         p += fixed.host_len;
@@ -6281,7 +6758,7 @@ static int dist_worker_upstream_send_work_result(
         const void *payload,
         uint32_t payload_bytes) {
     pthread_mutex_lock(&upstream->write_mu);
-    int rc = dist_send_work_result(upstream->fd,
+    int rc = dist_conn_send_work_result(upstream->conn,
                                    request_id,
                                    result_hash,
                                    status,
@@ -6300,7 +6777,7 @@ static int dist_worker_upstream_send_work_error(
         uint64_t request_id,
         const char *msg) {
     pthread_mutex_lock(&upstream->write_mu);
-    int rc = dist_send_work_error(upstream->fd, request_id, msg);
+    int rc = dist_conn_send_work_error(upstream->conn, request_id, msg);
     pthread_mutex_unlock(&upstream->write_mu);
     return rc;
 }
@@ -6308,10 +6785,10 @@ static int dist_worker_upstream_send_work_error(
 static void dist_worker_upstream_init(
         ds4_dist_worker_upstream *upstream,
         ds4_dist_worker_state *state,
-        int fd) {
+        ds4_dist_conn *conn) {
     memset(upstream, 0, sizeof(*upstream));
     upstream->state = state;
-    upstream->fd = fd;
+    upstream->conn = conn;
     pthread_mutex_init(&upstream->write_mu, NULL);
     pthread_mutex_init(&upstream->forward_mu, NULL);
 }
@@ -6437,22 +6914,12 @@ static void dist_worker_forwarder_close_queue(ds4_dist_worker_forwarder *forward
 static void *dist_worker_forwarder_relay_main(void *arg) {
     ds4_dist_worker_forwarder *forwarder = arg;
     ds4_dist_worker_upstream *upstream = forwarder->upstream;
-    int fd = forwarder->fd;
-    uint8_t *buf = malloc(1024 * 1024);
-    if (!buf) {
-        shutdown(upstream->fd, SHUT_RDWR);
-        return NULL;
-    }
-    DIST_DEBUG("relay start downstream=%s:%u fd=%d upstream_fd=%d",
-               forwarder->host,
-               forwarder->port,
-               fd,
-               upstream->fd);
+    ds4_dist_conn *fwd_conn = forwarder->conn;
 
     for (;;) {
         uint32_t type = 0, bytes = 0;
         char err[256];
-        int rc = dist_read_frame_header(fd, &type, &bytes, err, sizeof(err));
+        int rc = dist_conn_read_frame_header(fwd_conn, &type, &bytes, err, sizeof(err));
         if (rc <= 0) {
             uint64_t pending_request = 0;
             if (dist_worker_forwarder_pop_request(forwarder, &pending_request, NULL, NULL)) {
@@ -6460,83 +6927,69 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
                                                      pending_request,
                                                      "next worker closed connection");
             }
-            DIST_DEBUG("relay read header end downstream=%s:%u rc=%d err=%s",
-                       forwarder->host,
-                       forwarder->port,
-                       rc,
-                       err);
             break;
         }
-        DIST_DEBUG("relay got frame downstream=%s:%u type=%u bytes=%u",
-                   forwarder->host,
-                   forwarder->port,
-                   type,
-                   bytes);
         uint64_t expected_request = 0;
         if (type != DS4_DIST_MSG_RESULT || bytes < sizeof(ds4_dist_result_fixed)) {
-            dist_discard_bytes(fd, bytes);
+            dist_conn_discard_bytes(fwd_conn, bytes);
             if (dist_worker_forwarder_pop_request(forwarder, &expected_request, NULL, NULL)) {
                 dist_worker_upstream_send_work_error(upstream,
                                                      expected_request,
                                                      "next worker did not return valid RESULT");
             }
-            DIST_DEBUG("relay invalid frame downstream=%s:%u", forwarder->host, forwarder->port);
             break;
         }
 
-        ds4_dist_result_fixed wire_result;
-        rc = dist_read_full(fd, &wire_result, sizeof(wire_result));
+        /* Read the entire body into a buffer */
+        void *body = malloc(bytes);
+        if (!body) {
+            dist_conn_discard_bytes(fwd_conn, bytes);
+            if (dist_worker_forwarder_pop_request(forwarder, &expected_request, NULL, NULL)) {
+                dist_worker_upstream_send_work_error(upstream,
+                                                     expected_request,
+                                                     "out of memory in relay");
+            }
+            break;
+        }
+        rc = dist_conn_read_full(fwd_conn, body, bytes);
         if (rc <= 0) {
+            free(body);
             if (dist_worker_forwarder_pop_request(forwarder, &expected_request, NULL, NULL)) {
                 dist_worker_upstream_send_work_error(upstream,
                                                      expected_request,
                                                      "next worker closed while returning RESULT");
             }
-            DIST_DEBUG("relay read result fixed failed downstream=%s:%u rc=%d",
-                       forwarder->host,
-                       forwarder->port,
-                       rc);
             break;
         }
 
-        ds4_dist_result_fixed result = wire_result;
+        ds4_dist_result_fixed result;
+        memcpy(&result, body, sizeof(result));
         dist_result_from_wire(&result);
         const uint64_t got_request = dist_u64_from_halves(result.request_hi, result.request_lo);
-        const uint32_t body_bytes = bytes - (uint32_t)sizeof(wire_result);
+        const uint32_t body_bytes = bytes - (uint32_t)sizeof(result);
         if (result.telemetry_bytes % (uint32_t)sizeof(ds4_dist_telemetry_fixed) != 0 ||
             result.telemetry_count != result.telemetry_bytes / (uint32_t)sizeof(ds4_dist_telemetry_fixed) ||
             result.telemetry_bytes > body_bytes ||
             result.payload_bytes != body_bytes - result.telemetry_bytes) {
-            dist_discard_bytes(fd, body_bytes);
+            free(body);
             if (dist_worker_forwarder_pop_request(forwarder, &expected_request, NULL, NULL)) {
                 dist_worker_upstream_send_work_error(upstream,
                                                      expected_request,
                                                      "next worker RESULT metadata mismatch");
             }
-            DIST_DEBUG("relay result metadata mismatch downstream=%s:%u telemetry=%u payload=%u frame=%u",
-                       forwarder->host,
-                       forwarder->port,
-                       result.telemetry_bytes,
-                       result.payload_bytes,
-                       body_bytes);
             break;
         }
         ds4_dist_telemetry_fixed local_telemetry;
         double downstream_t0 = 0.0;
         if (!dist_worker_forwarder_pop_request(forwarder, &expected_request, &local_telemetry, &downstream_t0)) {
-            dist_discard_bytes(fd, body_bytes);
-            DIST_DEBUG("relay got unexpected result request=%llu with no pending request",
-                       (unsigned long long)got_request);
+            free(body);
             break;
         }
         if (got_request != expected_request) {
-            dist_discard_bytes(fd, body_bytes);
+            free(body);
             dist_worker_upstream_send_work_error(upstream,
                                                  expected_request,
                                                  "next worker RESULT metadata mismatch");
-            DIST_DEBUG("relay request mismatch expected=%llu got=%llu",
-                       (unsigned long long)expected_request,
-                       (unsigned long long)got_request);
             break;
         }
         local_telemetry.downstream_wait_usec = dist_usec_since(downstream_t0, dist_now_sec());
@@ -6544,7 +6997,7 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
             (uint64_t)result.telemetry_bytes + sizeof(ds4_dist_telemetry_fixed);
         const uint32_t out_telemetry_count = result.telemetry_count + 1u;
         if (out_telemetry_bytes64 > UINT32_MAX || out_telemetry_count == 0) {
-            dist_discard_bytes(fd, body_bytes);
+            free(body);
             dist_worker_upstream_send_work_error(upstream,
                                                  expected_request,
                                                  "distributed telemetry chain is too large");
@@ -6555,79 +7008,72 @@ static void *dist_worker_forwarder_relay_main(void *arg) {
                                            out_telemetry_bytes64 +
                                            (uint64_t)result.payload_bytes;
         if (out_frame_bytes64 > UINT32_MAX) {
-            dist_discard_bytes(fd, body_bytes);
+            free(body);
             dist_worker_upstream_send_work_error(upstream,
                                                  expected_request,
                                                  "distributed RESULT frame is too large");
             break;
         }
-        DIST_DEBUG("relay result request=%llu status=%u kind=%u telemetry=%u payload=%u",
-                   (unsigned long long)got_request,
-                   result.status,
-                   result.result_kind,
-                   out_telemetry_count,
-                   result.payload_bytes);
 
-        pthread_mutex_lock(&upstream->write_mu);
+        /* Build the output frame in a buffer:
+         * result_fixed (modified) + incoming_telemetry[0..n-2] + local_telemetry + last_incoming_telemetry + payload
+         *
+         * The original streaming code reads (telemetry_bytes - sizeof(telemetry)) bytes
+         * of incoming telemetry, writes them, then writes local telemetry, then reads
+         * payload_bytes (which includes the last incoming telemetry entry).  We replicate
+         * this exactly in memory. */
+        uint32_t out_body_bytes = (uint32_t)out_frame_bytes64;
+        void *out_body = malloc(out_body_bytes);
+        if (!out_body) {
+            free(body);
+            dist_worker_upstream_send_work_error(upstream,
+                                                 expected_request,
+                                                 "out of memory building relay RESULT");
+            break;
+        }
+        unsigned char *out_p = out_body;
+
+        /* Modified result_fixed */
         result.telemetry_count = out_telemetry_count;
         result.telemetry_bytes = out_telemetry_bytes;
         ds4_dist_result_fixed out_wire_result = result;
         dist_result_to_wire(&out_wire_result);
-        int write_rc = dist_write_frame_header(upstream->fd,
-                                               DS4_DIST_MSG_RESULT,
-                                               (uint32_t)out_frame_bytes64);
-        if (write_rc == 0) write_rc = dist_write_full(upstream->fd, &out_wire_result, sizeof(out_wire_result));
+        memcpy(out_p, &out_wire_result, sizeof(out_wire_result));
+        out_p += sizeof(out_wire_result);
 
-        uint32_t remaining = result.telemetry_bytes - (uint32_t)sizeof(ds4_dist_telemetry_fixed);
-        while (write_rc == 0 && remaining > 0) {
-            uint32_t n = remaining < 1024u * 1024u ? remaining : 1024u * 1024u;
-            rc = dist_read_full(fd, buf, n);
-            if (rc <= 0) {
-                write_rc = -1;
-                break;
-            }
-            if (dist_write_full(upstream->fd, buf, n) != 0) {
-                write_rc = -1;
-                break;
-            }
-            remaining -= n;
-        }
-        if (write_rc == 0) {
-            ds4_dist_telemetry_fixed local_wire = local_telemetry;
-            dist_telemetry_to_wire(&local_wire);
-            if (dist_write_full(upstream->fd, &local_wire, sizeof(local_wire)) != 0) {
-                write_rc = -1;
-            }
+        /* Incoming telemetry[0..n-2] */
+        uint32_t pass_telemetry = result.telemetry_bytes - (uint32_t)sizeof(ds4_dist_telemetry_fixed);
+        if (pass_telemetry > 0) {
+            memcpy(out_p, (char *)body + sizeof(result), pass_telemetry);
+            out_p += pass_telemetry;
         }
 
-        remaining = result.payload_bytes;
-        while (write_rc == 0 && remaining > 0) {
-            uint32_t n = remaining < 1024u * 1024u ? remaining : 1024u * 1024u;
-            rc = dist_read_full(fd, buf, n);
-            if (rc <= 0) {
-                write_rc = -1;
-                break;
-            }
-            if (dist_write_full(upstream->fd, buf, n) != 0) {
-                write_rc = -1;
-                break;
-            }
-            remaining -= n;
+        /* Local telemetry */
+        ds4_dist_telemetry_fixed local_wire = local_telemetry;
+        dist_telemetry_to_wire(&local_wire);
+        memcpy(out_p, &local_wire, sizeof(local_wire));
+        out_p += sizeof(local_wire);
+
+        /* Remaining body: last incoming telemetry entry + payload */
+        uint32_t remaining_body = body_bytes - pass_telemetry;
+        if (remaining_body > 0) {
+            memcpy(out_p, (char *)body + sizeof(result) + pass_telemetry, remaining_body);
+            out_p += remaining_body;
         }
+
+        pthread_mutex_lock(&upstream->write_mu);
+        int write_rc = ds4_dist_conn_send(upstream->conn, DS4_DIST_MSG_RESULT,
+                                          out_body, out_body_bytes);
         pthread_mutex_unlock(&upstream->write_mu);
 
-        DIST_DEBUG("relay wrote result request=%llu write_rc=%d remaining=%u",
-                   (unsigned long long)got_request,
-                   write_rc,
-                   remaining);
+        free(body);
+        free(out_body);
+
         if (write_rc != 0) break;
-        if (remaining != 0) break;
     }
 
-    DIST_DEBUG("relay closing upstream_fd=%d", upstream->fd);
     dist_worker_forwarder_close_queue(forwarder);
-    shutdown(upstream->fd, SHUT_RDWR);
-    free(buf);
+    ds4_dist_conn_shutdown(upstream->conn);
     return NULL;
 }
 
@@ -6651,9 +7097,28 @@ static ds4_dist_worker_forwarder *dist_worker_get_forwarder(
         return NULL;
     }
 
+    /* Wrap the fd in a conn (TCP or RDMA).  For RDMA, perform the handshake. */
+    ds4_dist_conn *conn;
+    if (dist_transport_is_rdma()) {
+        close(fd);
+        conn = dist_conn_open(host, (int)port, err, errlen);
+        if (!conn) {
+            pthread_mutex_unlock(&upstream->forward_mu);
+            return NULL;
+        }
+    } else {
+        conn = ds4_dist_conn_new_tcp(fd);
+        if (!conn) {
+            close(fd);
+            pthread_mutex_unlock(&upstream->forward_mu);
+            if (errlen) snprintf(err, errlen, "out of memory creating forwarder conn");
+            return NULL;
+        }
+    }
+
     ds4_dist_worker_forwarder *forwarder = calloc(1, sizeof(*forwarder));
     if (!forwarder) {
-        close(fd);
+        ds4_dist_conn_close(conn);
         pthread_mutex_unlock(&upstream->forward_mu);
         if (errlen) snprintf(err, errlen, "out of memory creating worker-to-worker forwarder");
         return NULL;
@@ -6661,7 +7126,7 @@ static ds4_dist_worker_forwarder *dist_worker_get_forwarder(
     forwarder->upstream = upstream;
     snprintf(forwarder->host, sizeof(forwarder->host), "%s", host);
     forwarder->port = port;
-    forwarder->fd = fd;
+    forwarder->conn = conn;
     forwarder->pending_depth = dist_worker_forward_window();
     pthread_mutex_init(&forwarder->send_mu, NULL);
     pthread_mutex_init(&forwarder->queue_mu, NULL);
@@ -6670,7 +7135,7 @@ static ds4_dist_worker_forwarder *dist_worker_get_forwarder(
         pthread_cond_destroy(&forwarder->queue_not_full);
         pthread_mutex_destroy(&forwarder->queue_mu);
         pthread_mutex_destroy(&forwarder->send_mu);
-        close(fd);
+        ds4_dist_conn_close(conn);
         free(forwarder);
         pthread_mutex_unlock(&upstream->forward_mu);
         if (errlen) snprintf(err, errlen, "failed to start worker-to-worker relay thread");
@@ -6697,12 +7162,12 @@ static void dist_worker_upstream_destroy(ds4_dist_worker_upstream *upstream) {
 
     for (ds4_dist_worker_forwarder *it = forwarders; it; it = it->next) {
         dist_worker_forwarder_close_queue(it);
-        if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
+        if (it->conn) ds4_dist_conn_shutdown(it->conn);
     }
     while (forwarders) {
         ds4_dist_worker_forwarder *next = forwarders->next;
         if (forwarders->thread_started) pthread_join(forwarders->tid, NULL);
-        if (forwarders->fd >= 0) close(forwarders->fd);
+        if (forwarders->conn) ds4_dist_conn_close(forwarders->conn);
         dist_worker_forwarder_clear_requests(forwarders);
         pthread_cond_destroy(&forwarders->queue_not_full);
         pthread_mutex_destroy(&forwarders->queue_mu);
@@ -6767,7 +7232,7 @@ static int dist_forward_work_to_next(
                forwarded.n_tokens,
                forwarded.pos0,
                forwarded.input_hc_bytes);
-    int rc = dist_send_work_frame(forwarder->fd, &forwarded, tokens, hidden_hc, route_blob);
+    int rc = dist_conn_send_work_frame(forwarder->conn, &forwarded, tokens, hidden_hc, route_blob);
     const double send_t1 = dist_now_sec();
     dist_worker_forwarder_note_send_done(forwarder,
                                          request_id,
@@ -6780,11 +7245,11 @@ static int dist_forward_work_to_next(
                    next->host,
                    next->port);
         dist_worker_forwarder_remove_request(forwarder, request_id);
-        shutdown(forwarder->fd, SHUT_RDWR);
+        ds4_dist_conn_shutdown(forwarder->conn);
         int err_rc = dist_worker_upstream_send_work_error(upstream,
                                                           request_id,
                                                           "failed to forward distributed work");
-        shutdown(upstream->fd, SHUT_RDWR);
+        ds4_dist_conn_shutdown(upstream->conn);
         return err_rc;
     }
     DIST_DEBUG("forward send ok request=%llu", (unsigned long long)request_id);
@@ -6883,15 +7348,15 @@ static int dist_worker_handle_snapshot_save(
     uint64_t request_id = 0;
     uint64_t session_id = 0;
     if (bytes != sizeof(req)) {
-        dist_discard_bytes(upstream->fd, bytes);
+        dist_conn_discard_bytes(upstream->conn, bytes);
         pthread_mutex_lock(&upstream->write_mu);
-        int rc = dist_send_snapshot_error(upstream->fd, 0, 0, state->model_id,
+        int rc = dist_send_snapshot_error(ds4_dist_conn_fd(upstream->conn), 0, 0, state->model_id,
                                           state->layer_start, state->layer_end,
                                           "invalid distributed snapshot save request");
         pthread_mutex_unlock(&upstream->write_mu);
         return rc;
     }
-    int rc = dist_read_full(upstream->fd, &req, sizeof(req));
+    int rc = dist_conn_read_full(upstream->conn, &req, sizeof(req));
     if (rc <= 0) return rc == 0 ? 0 : -1;
     dist_snapshot_req_from_wire(&req);
     request_id = dist_u64_from_halves(req.request_hi, req.request_lo);
@@ -6953,7 +7418,7 @@ static int dist_worker_handle_snapshot_save(
 
     pthread_mutex_lock(&upstream->write_mu);
     if (err[0]) {
-        rc = dist_send_snapshot_error(upstream->fd,
+        rc = dist_send_snapshot_error(ds4_dist_conn_fd(upstream->conn),
                                       request_id,
                                       session_id,
                                       state->model_id,
@@ -6970,9 +7435,9 @@ static int dist_worker_handle_snapshot_save(
         begin.layer_start = state->layer_start;
         begin.layer_end = state->layer_end;
         dist_u64_to_halves(payload_bytes, &begin.payload_hi, &begin.payload_lo);
-        rc = dist_send_snapshot_begin(upstream->fd, &begin, NULL, NULL);
-        if (rc > 0) rc = dist_send_snapshot_file_chunks(upstream->fd, request_id, tmp, payload_bytes);
-        if (rc > 0) rc = dist_send_snapshot_done(upstream->fd, request_id, 0, NULL);
+        rc = dist_send_snapshot_begin(ds4_dist_conn_fd(upstream->conn), &begin, NULL, NULL);
+        if (rc > 0) rc = dist_send_snapshot_file_chunks(ds4_dist_conn_fd(upstream->conn), request_id, tmp, payload_bytes);
+        if (rc > 0) rc = dist_send_snapshot_done(ds4_dist_conn_fd(upstream->conn), request_id, 0, NULL);
     }
     pthread_mutex_unlock(&upstream->write_mu);
 
@@ -6990,10 +7455,10 @@ static int dist_worker_handle_snapshot_load(
     uint64_t session_id = 0;
     char err[256] = {0};
     if (bytes < sizeof(begin)) {
-        dist_discard_bytes(upstream->fd, bytes);
+        dist_conn_discard_bytes(upstream->conn, bytes);
         return -1;
     }
-    int rc = dist_read_full(upstream->fd, &begin, sizeof(begin));
+    int rc = dist_conn_read_full(upstream->conn, &begin, sizeof(begin));
     if (rc <= 0) return rc == 0 ? 0 : -1;
     dist_snapshot_begin_from_wire(&begin);
     request_id = dist_u64_from_halves(begin.request_hi, begin.request_lo);
@@ -7008,7 +7473,7 @@ static int dist_worker_handle_snapshot_load(
         begin.token_bytes != (uint32_t)expected_token_bytes ||
         begin.message_bytes != 0 ||
         body_bytes != begin.token_bytes) {
-        dist_discard_bytes(upstream->fd, body_bytes);
+        dist_conn_discard_bytes(upstream->conn, body_bytes);
         snprintf(err, sizeof(err), "invalid distributed snapshot load header");
     }
 
@@ -7016,13 +7481,13 @@ static int dist_worker_handle_snapshot_load(
     if (!err[0]) {
         tokens = malloc((size_t)begin.token_count * sizeof(tokens[0]));
         if (!tokens && begin.token_count != 0) {
-            dist_discard_bytes(upstream->fd, begin.token_bytes);
+            dist_conn_discard_bytes(upstream->conn, begin.token_bytes);
             snprintf(err, sizeof(err), "out of memory reading snapshot tokens");
         }
     }
     for (uint32_t i = 0; !err[0] && i < begin.token_count; i++) {
         uint32_t wire_token = 0;
-        rc = dist_read_full(upstream->fd, &wire_token, sizeof(wire_token));
+        rc = dist_conn_read_full(upstream->conn, &wire_token, sizeof(wire_token));
         if (rc <= 0) {
             free(tokens);
             return rc == 0 ? 0 : -1;
@@ -7062,7 +7527,7 @@ static int dist_worker_handle_snapshot_load(
     uint64_t received = 0;
     while (!err[0] && received < payload_bytes) {
         uint32_t type = 0, chunk_frame_bytes = 0;
-        rc = dist_read_frame_header(upstream->fd, &type, &chunk_frame_bytes, err, sizeof(err));
+        rc = dist_conn_read_frame_header(upstream->conn, &type, &chunk_frame_bytes, err, sizeof(err));
         if (rc <= 0) {
             free(buf);
             free(tokens);
@@ -7072,12 +7537,12 @@ static int dist_worker_handle_snapshot_load(
         }
         if (type != DS4_DIST_MSG_SNAPSHOT_CHUNK ||
             chunk_frame_bytes < sizeof(ds4_dist_snapshot_chunk_fixed)) {
-            dist_discard_bytes(upstream->fd, chunk_frame_bytes);
+            dist_conn_discard_bytes(upstream->conn, chunk_frame_bytes);
             snprintf(err, sizeof(err), "expected distributed snapshot chunk");
             break;
         }
         ds4_dist_snapshot_chunk_fixed chunk;
-        rc = dist_read_full(upstream->fd, &chunk, sizeof(chunk));
+        rc = dist_conn_read_full(upstream->conn, &chunk, sizeof(chunk));
         if (rc <= 0) {
             free(buf);
             free(tokens);
@@ -7092,11 +7557,11 @@ static int dist_worker_handle_snapshot_load(
             chunk.chunk_bytes != chunk_bytes ||
             chunk_bytes > DS4_DIST_SNAPSHOT_CHUNK_BYTES ||
             chunk_bytes > payload_bytes - received) {
-            dist_discard_bytes(upstream->fd, chunk_bytes);
+            dist_conn_discard_bytes(upstream->conn, chunk_bytes);
             snprintf(err, sizeof(err), "invalid distributed snapshot chunk");
             break;
         }
-        rc = dist_read_full(upstream->fd, buf, chunk_bytes);
+        rc = dist_conn_read_full(upstream->conn, buf, chunk_bytes);
         if (rc <= 0) {
             free(buf);
             free(tokens);
@@ -7146,7 +7611,7 @@ static int dist_worker_handle_snapshot_load(
     free(tokens);
 
     pthread_mutex_lock(&upstream->write_mu);
-    rc = dist_send_snapshot_done(upstream->fd, request_id, err[0] ? 1u : 0u,
+    rc = dist_send_snapshot_done(ds4_dist_conn_fd(upstream->conn), request_id, err[0] ? 1u : 0u,
                                  err[0] ? err : NULL);
     pthread_mutex_unlock(&upstream->write_mu);
     if (err[0] && received < payload_bytes) return -1;
@@ -7607,10 +8072,10 @@ static int dist_worker_handle_work(
         uint32_t bytes) {
     void *payload = malloc(bytes);
     if (!payload) {
-        dist_discard_bytes(upstream->fd, bytes);
+        dist_conn_discard_bytes(upstream->conn, bytes);
         return dist_worker_upstream_send_work_error(upstream, 0, "out of memory reading distributed WORK frame");
     }
-    int rc = dist_read_full(upstream->fd, payload, bytes);
+    int rc = dist_conn_read_full(upstream->conn, payload, bytes);
     if (rc <= 0) {
         free(payload);
         return rc == 0 ? 0 : -1;
@@ -7736,16 +8201,16 @@ static void *dist_worker_prefetch_eval_main(void *arg) {
             q->rc = rc == 0 ? 0 : 1;
             pthread_mutex_unlock(&q->mu);
             dist_worker_job_queue_cancel(q);
-            shutdown(q->upstream->fd, SHUT_RDWR);
+            ds4_dist_conn_shutdown(q->upstream->conn);
             break;
         }
     }
     return NULL;
 }
 
-static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) {
+static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, ds4_dist_conn *conn) {
     ds4_dist_worker_upstream upstream;
-    dist_worker_upstream_init(&upstream, state, fd);
+    dist_worker_upstream_init(&upstream, state, conn);
 
     ds4_dist_worker_job_queue queue;
     dist_worker_job_queue_init(&queue, state, &upstream);
@@ -7765,7 +8230,7 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
     for (;;) {
         uint32_t type = 0, bytes = 0;
         char err[256];
-        int rc = dist_read_frame_header(fd, &type, &bytes, err, sizeof(err));
+        int rc = dist_conn_read_frame_header(conn, &type, &bytes, err, sizeof(err));
         if (rc == 0) break;
         if (rc < 0) {
             fprintf(stderr, "ds4: distributed worker: protocol error: %s\n", err);
@@ -7775,13 +8240,13 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
         if (type == DS4_DIST_MSG_ERROR) {
             char msg[512];
             uint32_t n = bytes < sizeof(msg) - 1u ? bytes : (uint32_t)sizeof(msg) - 1u;
-            rc = dist_read_full(fd, msg, n);
+            rc = dist_conn_read_full(conn, msg, n);
             if (rc <= 0) {
                 loop_rc = 1;
                 break;
             }
             msg[n] = '\0';
-            if (bytes > n) dist_discard_bytes(fd, bytes - n);
+            if (bytes > n) dist_conn_discard_bytes(conn, bytes - n);
             fprintf(stderr, "ds4: distributed worker: coordinator error: %s\n", msg);
             loop_rc = 1;
             break;
@@ -7789,7 +8254,7 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
         if (type == DS4_DIST_MSG_WORK) {
             ds4_dist_worker_job *job = calloc(1, sizeof(*job));
             if (!job) {
-                dist_discard_bytes(fd, bytes);
+                dist_conn_discard_bytes(conn, bytes);
                 dist_worker_upstream_send_work_error(&upstream, 0, "out of memory queueing distributed WORK");
                 loop_rc = 1;
                 break;
@@ -7798,12 +8263,12 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
             job->bytes = bytes;
             if (!job->payload) {
                 dist_worker_job_free(job);
-                dist_discard_bytes(fd, bytes);
+                dist_conn_discard_bytes(conn, bytes);
                 dist_worker_upstream_send_work_error(&upstream, 0, "out of memory reading distributed WORK frame");
                 loop_rc = 1;
                 break;
             }
-            rc = dist_read_full(fd, job->payload, bytes);
+            rc = dist_conn_read_full(conn, job->payload, bytes);
             if (rc <= 0) {
                 dist_worker_job_free(job);
                 loop_rc = rc == 0 ? 0 : 1;
@@ -7832,13 +8297,13 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
             }
             continue;
         }
-        rc = dist_discard_bytes(fd, bytes);
+        rc = dist_conn_discard_bytes(conn, bytes);
         if (rc <= 0) {
             loop_rc = rc == 0 ? 0 : 1;
             break;
         }
         pthread_mutex_lock(&upstream.write_mu);
-        dist_send_error(fd, "unsupported distributed worker frame");
+        dist_conn_send_error(conn, "unsupported distributed worker frame");
         pthread_mutex_unlock(&upstream.write_mu);
         fprintf(stderr, "ds4: distributed worker: rejected unsupported frame type %u\n", type);
         loop_rc = 1;
@@ -7857,7 +8322,7 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
 static void *dist_worker_data_client_main(void *arg) {
     ds4_dist_data_client_ctx *ctx = arg;
     ds4_dist_worker_state *state = ctx->state;
-    int fd = ctx->fd;
+    ds4_dist_conn *conn = ctx->conn;
     char peer_host[NI_MAXHOST];
     char peer_port[NI_MAXSERV];
     snprintf(peer_host, sizeof(peer_host), "%s", ctx->peer_host);
@@ -7865,8 +8330,8 @@ static void *dist_worker_data_client_main(void *arg) {
     free(ctx);
 
     int rc = getenv("DS4_DIST_DISABLE_WORKER_PREFETCH")
-        ? dist_worker_read_loop(state, fd)
-        : dist_worker_read_loop_prefetch(state, fd);
+        ? dist_worker_read_loop(state, conn)
+        : dist_worker_read_loop_prefetch(state, conn);
     if (rc != 0) {
         fprintf(stderr,
                 "ds4: distributed worker: data connection %s:%s closed after error\n",
@@ -7874,7 +8339,7 @@ static void *dist_worker_data_client_main(void *arg) {
                 peer_port);
     }
 
-    close(fd);
+    ds4_dist_conn_close(conn);
     return NULL;
 }
 
@@ -7882,28 +8347,34 @@ static void *dist_worker_data_listener_main(void *arg) {
     ds4_dist_worker_state *state = arg;
     int listen_fd = state->listen_fd;
     for (;;) {
-        struct sockaddr_storage ss;
-        socklen_t slen = sizeof(ss);
-        int fd = accept(listen_fd, (struct sockaddr *)&ss, &slen);
-        if (fd < 0) {
+        char err[256];
+        ds4_dist_conn *conn = dist_conn_accept(listen_fd, err, sizeof(err));
+        if (!conn) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "ds4: distributed worker: data accept failed: %s\n", strerror(errno));
+            fprintf(stderr, "ds4: distributed worker: data accept failed: %s\n", err);
             continue;
         }
-        dist_set_socket_low_latency(fd);
 
         ds4_dist_data_client_ctx *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
             fprintf(stderr, "ds4: distributed worker: out of memory accepting data connection\n");
-            close(fd);
+            ds4_dist_conn_close(conn);
             continue;
         }
         ctx->state = state;
-        ctx->fd = fd;
-        if (getnameinfo((struct sockaddr *)&ss, slen,
-                        ctx->peer_host, sizeof(ctx->peer_host),
-                        ctx->peer_port, sizeof(ctx->peer_port),
-                        NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+        ctx->conn = conn;
+        /* Get peer name from the underlying fd */
+        struct sockaddr_storage ss;
+        socklen_t slen = sizeof(ss);
+        if (getpeername(ds4_dist_conn_fd(conn), (struct sockaddr *)&ss, &slen) == 0) {
+            if (getnameinfo((struct sockaddr *)&ss, slen,
+                            ctx->peer_host, sizeof(ctx->peer_host),
+                            ctx->peer_port, sizeof(ctx->peer_port),
+                            NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+                snprintf(ctx->peer_host, sizeof(ctx->peer_host), "unknown");
+                snprintf(ctx->peer_port, sizeof(ctx->peer_port), "0");
+            }
+        } else {
             snprintf(ctx->peer_host, sizeof(ctx->peer_host), "unknown");
             snprintf(ctx->peer_port, sizeof(ctx->peer_port), "0");
         }
@@ -7911,7 +8382,7 @@ static void *dist_worker_data_listener_main(void *arg) {
         pthread_t tid;
         if (pthread_create(&tid, NULL, dist_worker_data_client_main, ctx) != 0) {
             fprintf(stderr, "ds4: distributed worker: pthread_create failed for data connection\n");
-            close(fd);
+            ds4_dist_conn_close(conn);
             free(ctx);
             continue;
         }
@@ -7925,6 +8396,7 @@ static void *dist_worker_data_listener_main(void *arg) {
  * ========================================================================= */
 
 static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int ctx_size) {
+    dist_transport_init(opt);
     char layer_end[32];
     if (opt->layers.has_output) snprintf(layer_end, sizeof(layer_end), "output");
     else snprintf(layer_end, sizeof(layer_end), "%u", opt->layers.end);
@@ -7993,10 +8465,21 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
             continue;
         }
 
+        /* Wrap the control fd in a TCP conn.  The control connection always
+         * stays TCP — it carries HELLO, monitoring, and KV snapshots.
+         * When RDMA is enabled and use_control_for_work is false, WORK/RESULT
+         * frames flow over separate RDMA data connections via the data listener. */
+        ds4_dist_conn *conn = ds4_dist_conn_new_tcp(fd);
+        if (!conn) {
+            close(fd);
+            dist_sleep_reconnect();
+            continue;
+        }
+
         int rc = getenv("DS4_DIST_DISABLE_WORKER_PREFETCH")
-            ? dist_worker_read_loop(&state, fd)
-            : dist_worker_read_loop_prefetch(&state, fd);
-        close(fd);
+            ? dist_worker_read_loop(&state, conn)
+            : dist_worker_read_loop_prefetch(&state, conn);
+        ds4_dist_conn_close(conn);
         uint32_t dropped_sessions = dist_worker_clear_sessions(&state);
         if (dropped_sessions) {
             fprintf(stderr,
@@ -8126,6 +8609,8 @@ ds4_dist_options *ds4_dist_options_create(void) {
 }
 
 void ds4_dist_options_free(ds4_dist_options *opt) {
+    if (!opt) return;
+    free((void *)opt->rdma_device);
     free(opt);
 }
 
@@ -8148,6 +8633,12 @@ void ds4_dist_usage(FILE *fp) {
         "      Coordinator hidden-state transport width: 32, 16, or 8. Default: 32.\n"
         "  --dist-replay-check\n"
         "      Coordinator diagnostic: reset and replay the prompt, then compare logits.\n"
+        "  --dist-transport {tcp,rdma}\n"
+        "      Data-plane transport: tcp (default) or rdma (Thunderbolt 5, macOS 26.2+).\n"
+        "      When rdma is selected, WORK/RESULT frames use RDMA queue pairs; control\n"
+        "      (HELLO, monitoring, KV snapshots) stays on TCP.\n"
+        "  --dist-rdma-device NAME\n"
+        "      RDMA device name (e.g. rdma_en3). Default: auto-detect first PORT_ACTIVE device.\n"
         "  --debug\n"
         "      Print coordinator route/debug logs. Workers keep their normal logs without this.\n"
     );
@@ -8278,6 +8769,37 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         opt->replay_check = true;
         return DS4_DIST_CLI_MATCHED;
     }
+    if (!strcmp(arg, "--dist-transport")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return DS4_DIST_CLI_ERROR;
+        if (!strcmp(value, "tcp")) {
+            opt->transport = 0;
+        } else if (!strcmp(value, "rdma")) {
+            opt->transport = 1;
+        } else {
+            if (errlen) snprintf(err, errlen, "--dist-transport must be tcp or rdma");
+            return DS4_DIST_CLI_ERROR;
+        }
+        return DS4_DIST_CLI_MATCHED;
+    }
+    if (!strcmp(arg, "--dist-rdma-device")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        const char *value = dist_cli_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return DS4_DIST_CLI_ERROR;
+        opt->rdma_device = strdup(value);
+        if (!opt->rdma_device) {
+            if (errlen) snprintf(err, errlen, "out of memory");
+            return DS4_DIST_CLI_ERROR;
+        }
+        return DS4_DIST_CLI_MATCHED;
+    }
     if (!strcmp(arg, "--debug")) {
         if (!opt) {
             if (errlen) snprintf(err, errlen, "missing distributed options");
@@ -8316,6 +8838,10 @@ static int dist_validate_options(const ds4_dist_options *opt, char *err, size_t 
     }
     if (opt->activation_bits != 0 && !dist_activation_bits_valid(opt->activation_bits)) {
         if (errlen) snprintf(err, errlen, "--dist-activation-bits must be 32, 16, or 8");
+        return 1;
+    }
+    if (opt->transport == 1 && !ds4_dist_rdma_available()) {
+        if (errlen) snprintf(err, errlen, "--dist-transport rdma requires RDMA devices (run 'ibv_devices' to verify)");
         return 1;
     }
 

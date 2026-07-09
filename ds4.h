@@ -89,6 +89,8 @@ typedef struct {
     uint32_t activation_bits;
     bool replay_check;
     bool debug;
+    int transport;          /* 0 = tcp, 1 = rdma */
+    const char *rdma_device; /* RDMA device name (e.g. "rdma_en3"), or NULL for auto */
 } ds4_distributed_options;
 
 typedef struct {
