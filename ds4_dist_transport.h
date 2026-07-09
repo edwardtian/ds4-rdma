@@ -172,7 +172,7 @@ bool ds4_dist_rdma_available(void);
 const char *ds4_dist_rdma_auto_device(void);
 
 /* Maximum message size for RDMA (16,773,120 bytes per TN3205). */
-#define DS4_DIST_RDMA_MAX_MESSAGE 16777312u
+#define DS4_DIST_RDMA_MAX_MESSAGE 16773120u
 
 /* Compute the max tokens that fit in one RDMA message given hc_values and
  * bits-per-activation-element. */

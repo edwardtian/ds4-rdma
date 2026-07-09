@@ -84,7 +84,7 @@ typedef struct {
  * The buffer size must not exceed 4095 * 4096 = 16,773,120 bytes. */
 #define DS4_DIST_RDMA_QP_DEPTH 4095
 #define DS4_DIST_RDMA_CQ_DEPTH 4096
-#define DS4_DIST_RDMA_MAX_MSG  167773120  /* 4095 * 4096 */
+#define DS4_DIST_RDMA_MAX_MSG  16773120u  /* 4095 * 4096 */
 #define DS4_DIST_RDMA_BUF_SIZE DS4_DIST_RDMA_MAX_MSG
 
 #endif /* DS4_HAS_VERBS_H */
@@ -399,8 +399,9 @@ static int rdma_handshake(ds4_dist_conn *c, ds4_dist_rdma_ctx *r,
     wr.num_sge = 1;
 
     struct ibv_recv_wr *bad_wr;
-    if (ibv_post_recv(r->qp, &wr, &bad_wr) != 0) {
-        if (errlen) snprintf(err, errlen, "ibv_post_recv failed: %s", strerror(errno));
+    int post_rc = ibv_post_recv(r->qp, &wr, &bad_wr);
+        if (post_rc != 0) {
+        if (errlen) snprintf(err, errlen, "ibv_post_recv failed (rc=%d): %s", post_rc, strerror(post_rc));
         return -1;
     }
     r->recv_posted = true;
@@ -427,8 +428,9 @@ static int rdma_recv_wait(ds4_dist_rdma_ctx *r, char *err, size_t errlen) {
         wr.num_sge = 1;
 
         struct ibv_recv_wr *bad_wr;
-        if (ibv_post_recv(r->qp, &wr, &bad_wr) != 0) {
-            if (errlen) snprintf(err, errlen, "ibv_post_recv failed: %s", strerror(errno));
+        int post_rc = ibv_post_recv(r->qp, &wr, &bad_wr);
+        if (post_rc != 0) {
+            if (errlen) snprintf(err, errlen, "ibv_post_recv failed (rc=%d): %s", post_rc, strerror(post_rc));
             return -1;
         }
         r->recv_posted = true;
@@ -497,8 +499,9 @@ static int rdma_send_frame(ds4_dist_rdma_ctx *r, uint32_t type,
     wr.send_flags = IBV_SEND_SIGNALED;
 
     struct ibv_send_wr *bad_wr;
-    if (ibv_post_send(r->qp, &wr, &bad_wr) != 0) {
-        if (errlen) snprintf(err, errlen, "ibv_post_send failed: %s", strerror(errno));
+    int post_rc = ibv_post_send(r->qp, &wr, &bad_wr);
+        if (post_rc != 0) {
+        if (errlen) snprintf(err, errlen, "ibv_post_send failed (rc=%d): %s", post_rc, strerror(post_rc));
         return -1;
     }
 
@@ -537,8 +540,9 @@ static int rdma_send_frame2(ds4_dist_rdma_ctx *r, uint32_t type,
     wr.send_flags = IBV_SEND_SIGNALED;
 
     struct ibv_send_wr *bad_wr;
-    if (ibv_post_send(r->qp, &wr, &bad_wr) != 0) {
-        if (errlen) snprintf(err, errlen, "ibv_post_send failed: %s", strerror(errno));
+    int post_rc = ibv_post_send(r->qp, &wr, &bad_wr);
+        if (post_rc != 0) {
+        if (errlen) snprintf(err, errlen, "ibv_post_send failed (rc=%d): %s", post_rc, strerror(post_rc));
         return -1;
     }
 
