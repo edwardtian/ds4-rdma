@@ -78,13 +78,13 @@ typedef struct {
 } ds4_dist_rdma_ctx;
 
 /* Per TN3205, queue depth is in units of 4 KB frames.  A single message of
- * N bytes consumes ceil(N/4096) WR slots.  To allow messages up to the
- * 16,773,120-byte limit (4095 * 4096), we must request max_send_wr and
- * max_recv_wr of at least 4095.  The CQ must be at least as deep.
- * The buffer size must not exceed 4095 * 4096 = 16,773,120 bytes. */
+ * N bytes consumes ceil(N/4096) WR slots.  We request max_send/max_recv_wr
+ * of 4095 (the TN3205 maximum), but size the buffer to 4094 frames so the
+ * SGE never consumes all 4095 queue slots — the TB5 hardware appears to
+ * require at least 1 frame of headroom. */
 #define DS4_DIST_RDMA_QP_DEPTH 4095
 #define DS4_DIST_RDMA_CQ_DEPTH 4096
-#define DS4_DIST_RDMA_MAX_MSG  16773120u  /* 4095 * 4096 */
+#define DS4_DIST_RDMA_MAX_MSG  16769024u  /* 4094 * 4096 */
 #define DS4_DIST_RDMA_BUF_SIZE DS4_DIST_RDMA_MAX_MSG
 
 #endif /* DS4_HAS_VERBS_H */
