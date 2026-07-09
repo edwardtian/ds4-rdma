@@ -84,7 +84,7 @@ typedef struct {
  * The buffer size must not exceed 4095 * 4096 = 16,773,120 bytes. */
 #define DS4_DIST_RDMA_QP_DEPTH 4095
 #define DS4_DIST_RDMA_CQ_DEPTH 4096
-#define DS4_DIST_RDMA_MAX_MSG  16777312u  /* 4095 * 4096 */
+#define DS4_DIST_RDMA_MAX_MSG  167773120  /* 4095 * 4096 */
 #define DS4_DIST_RDMA_BUF_SIZE DS4_DIST_RDMA_MAX_MSG
 
 #endif /* DS4_HAS_VERBS_H */
