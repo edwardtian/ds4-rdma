@@ -3947,9 +3947,14 @@ static int dist_coordinator_prefill_chunk_cap(
         uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
         uint32_t activation_bits = state->activation_bits ? state->activation_bits : 32u;
         uint32_t rdma_max = ds4_dist_rdma_max_tokens(hc_values, activation_bits);
+        fprintf(stderr, "ds4: distributed rdma debug: prefill chunk cap rdma_max=%u (hc_values=%llu bits=%u) requested=%u\n",
+                rdma_max, (unsigned long long)hc_values, activation_bits, requested);
         if (requested > rdma_max) {
             requested = rdma_max;
         }
+    } else {
+        fprintf(stderr, "ds4: distributed rdma debug: RDMA cap skipped (is_rdma=%d state=%p engine=%p)\n",
+                dist_transport_is_rdma(), (const void *)state, state ? (const void *)state->engine : NULL);
     }
     *chunk_cap = requested;
     return 0;

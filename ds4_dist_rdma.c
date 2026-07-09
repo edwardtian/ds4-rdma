@@ -443,7 +443,8 @@ static int rdma_recv_wait(ds4_dist_rdma_ctx *r, char *err, size_t errlen) {
     } while (n == 0);
 
     if (n < 0 || wc.status != IBV_WC_SUCCESS) {
-        if (errlen) snprintf(err, errlen, "RDMA recv failed (wc.status=%d)", wc.status);
+        if (errlen) snprintf(err, errlen, "RDMA recv failed (wc.status=%d byte_len=%u recv_cap=%zu)",
+                             wc.status, wc.byte_len, r->recv_cap);
         r->recv_posted = false;
         return -1;
     }
@@ -452,6 +453,8 @@ static int rdma_recv_wait(ds4_dist_rdma_ctx *r, char *err, size_t errlen) {
     r->recv_ready = true;
     r->recv_len = wc.byte_len;
     r->recv_consumed = 0;
+    fprintf(stderr, "ds4: distributed rdma debug: recv byte_len=%u recv_cap=%zu\n",
+            r->recv_len, r->recv_cap);
     return 0;
 }
 
@@ -474,6 +477,8 @@ static int rdma_send_frame(ds4_dist_rdma_ctx *r, uint32_t type,
                            const void *body, uint32_t body_bytes,
                            char *err, size_t errlen) {
     uint32_t total = DS4_DIST_TRANSPORT_HEADER_BYTES + body_bytes;
+    fprintf(stderr, "ds4: distributed rdma debug: send type=%u body=%u total=%u cap=%zu\n",
+            type, body_bytes, total, r->send_cap);
     if (total > r->send_cap) {
         if (errlen) snprintf(err, errlen, "RDMA frame %u exceeds send buffer %zu", total, r->send_cap);
         return -1;
