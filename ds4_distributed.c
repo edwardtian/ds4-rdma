@@ -1813,7 +1813,8 @@ static int dist_connect_endpoint_once(const char *host, int port, int *last_errn
             }
             continue;
         }
-        dist_set_socket_low_latency(fd);
+        int ll_rc = dist_set_socket_low_latency(fd);
+        if (trace) fprintf(stderr, "ds4: distributed connect trace: set_socket_low_latency rc=%d\n", ll_rc);
         if (bind_if) {
             int bind_errno = 0;
             if (dist_bind_connect_interface(fd, ai->ai_family, bind_if, &bind_errno) != 0) {
