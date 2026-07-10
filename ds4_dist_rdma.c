@@ -162,10 +162,12 @@ static ds4_dist_rdma_ctx *rdma_ctx_create(const char *device_name, char *err, si
     }
 
     struct ibv_device *dev = NULL;
+    const char *selected_name = NULL;
     if (device_name && device_name[0]) {
         for (int i = 0; i < num_devices; i++) {
             if (strcmp(ibv_get_device_name(dev_list[i]), device_name) == 0) {
                 dev = dev_list[i];
+                selected_name = device_name;
                 break;
             }
         }
@@ -182,11 +184,14 @@ static ds4_dist_rdma_ctx *rdma_ctx_create(const char *device_name, char *err, si
             struct ibv_port_attr attr;
             if (ibv_query_port(ctx, 1, &attr) == 0 && attr.state == IBV_PORT_ACTIVE) {
                 dev = dev_list[i];
+                selected_name = ibv_get_device_name(dev_list[i]);
             }
             ibv_close_device(ctx);
         }
         if (!dev) dev = dev_list[0];
+        if (!selected_name) selected_name = ibv_get_device_name(dev);
     }
+    fprintf(stderr, "ds4: distributed rdma: selected device '%s'\n", selected_name);
 
     struct ibv_context *ctx = ibv_open_device(dev);
     ibv_free_device_list(dev_list);
