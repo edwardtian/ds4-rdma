@@ -139,6 +139,11 @@ int ds4_dist_conn_recv_body(
         void *buf,
         uint32_t bytes);
 
+/* Re-arm the recv after consuming a message body.  For RDMA, posts a fresh
+ * recv so the QP always has one pending — prevents the race where the sender
+ * sends before we post the next recv.  Safe to call on TCP (no-op). */
+void ds4_dist_conn_recv_rearm(ds4_dist_conn *c);
+
 /* Discard body_bytes of frame body.  Returns 1 on success, 0 on EOF, -1
  * on error. */
 int ds4_dist_conn_discard(

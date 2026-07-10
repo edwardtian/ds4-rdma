@@ -831,7 +831,12 @@ int ds4_dist_conn_recv_body(
         if (bytes > available) return -1;
         memcpy(buf, (char *)r->recv_ptr + r->recv_consumed, bytes);
         r->recv_consumed += bytes;
-        if (r->recv_consumed >= r->recv_len) r->recv_ready = false;
+        if (r->recv_consumed >= r->recv_len) {
+            r->recv_ready = false;
+            /* Re-arm the recv immediately to avoid a race where the sender
+             * sends the next message before we post a fresh recv. */
+            ds4_dist_conn_recv_rearm(c);
+        }
         return 1;
     }
 #endif
@@ -850,7 +855,10 @@ int ds4_dist_conn_discard(
         uint32_t available = r->recv_len - r->recv_consumed;
         if (bytes > available) bytes = available;
         r->recv_consumed += bytes;
-        if (r->recv_consumed >= r->recv_len) r->recv_ready = false;
+        if (r->recv_consumed >= r->recv_len) {
+            r->recv_ready = false;
+            ds4_dist_conn_recv_rearm(c);
+        }
         return 1;
     }
 #endif
@@ -863,6 +871,37 @@ int ds4_dist_conn_discard(
         bytes -= n;
     }
     return 1;
+}
+
+/* ----------------------------------------------------------------------- *
+ * Recv re-arm
+ * ----------------------------------------------------------------------- */
+
+void ds4_dist_conn_recv_rearm(ds4_dist_conn *c) {
+    if (!c) return;
+#ifdef DS4_HAS_VERBS_H
+    if (c->rdma) {
+        ds4_dist_rdma_ctx *r = (ds4_dist_rdma_ctx *)c->rdma;
+        if (r->recv_posted) return; /* already posted */
+        if (r->recv_ready) return;  /* data still pending, don't overwrite */
+
+        struct ibv_sge sge;
+        memset(&sge, 0, sizeof(sge));
+        sge.addr = (uintptr_t)r->recv_ptr;
+        sge.length = (uint32_t)r->recv_cap;
+        sge.lkey = r->mr->lkey;
+
+        struct ibv_recv_wr wr;
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = 2;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+
+        struct ibv_recv_wr *bad_wr;
+        int post_rc = ibv_post_recv(r->qp, &wr, &bad_wr);
+        if (post_rc == 0) r->recv_posted = true;
+    }
+#endif
 }
 
 /* ----------------------------------------------------------------------- *
