@@ -77,15 +77,12 @@ typedef struct {
     ds4_dist_rdma_dest  local;
 } ds4_dist_rdma_ctx;
 
-/* Per TN3205, queue depth is in units of 4 KB frames.  A single message of
- * N bytes consumes ceil(N/4096) WR slots.  We request max_send/max_recv_wr
- * of 4095 (the TN3205 maximum), but size the buffer to 4094 frames so the
- * SGE never consumes all 4095 queue slots — the TB5 hardware appears to
- * require at least 1 frame of headroom. */
+/* Per TN3205, queue depth is in units of 4 KB frames.  We request 4095
+ * max_send/max_recv_wr.  Use a conservative 1 MiB buffer (256 frames)
+ * for initial testing. */
 #define DS4_DIST_RDMA_QP_DEPTH 4095
 #define DS4_DIST_RDMA_CQ_DEPTH 4096
-#define DS4_DIST_RDMA_MAX_MSG  16769024u  /* 4094 * 4096 */
-#define DS4_DIST_RDMA_BUF_SIZE DS4_DIST_RDMA_MAX_MSG
+#define DS4_DIST_RDMA_MAX_MSG  1048576u  /* 256 * 4096 = 1 MiB */
 
 #endif /* DS4_HAS_VERBS_H */
 
@@ -212,16 +209,16 @@ static ds4_dist_rdma_ctx *rdma_ctx_create(const char *device_name, char *err, si
         goto fail;
     }
 
-    r->buf_size = DS4_DIST_RDMA_BUF_SIZE * 2;
+    r->buf_size = DS4_DIST_RDMA_MAX_MSG * 2;
     if (posix_memalign(&r->buf, 4096, r->buf_size) != 0) {
         if (errlen) snprintf(err, errlen, "posix_memalign failed for RDMA buffer");
         goto fail;
     }
     memset(r->buf, 0, r->buf_size);
     r->send_ptr = r->buf;
-    r->recv_ptr = (char *)r->buf + DS4_DIST_RDMA_BUF_SIZE;
-    r->send_cap = DS4_DIST_RDMA_BUF_SIZE;
-    r->recv_cap = DS4_DIST_RDMA_BUF_SIZE;
+    r->recv_ptr = (char *)r->buf + DS4_DIST_RDMA_MAX_MSG;
+    r->send_cap = DS4_DIST_RDMA_MAX_MSG;
+    r->recv_cap = DS4_DIST_RDMA_MAX_MSG;
 
     r->mr = ibv_reg_mr(r->pd, r->buf, r->buf_size, IBV_ACCESS_LOCAL_WRITE);
     if (!r->mr) {
@@ -253,15 +250,20 @@ static ds4_dist_rdma_ctx *rdma_ctx_create(const char *device_name, char *err, si
     /* Check actual QP capabilities — the hardware may adjust queue depths. */
     struct ibv_qp_attr qp_attr;
     struct ibv_qp_init_attr qp_init_attr_check;
+    memset(&qp_attr, 0, sizeof(qp_attr));
+    memset(&qp_init_attr_check, 0, sizeof(qp_init_attr_check));
     if (ibv_query_qp(r->qp, &qp_attr, IBV_QP_CAP, &qp_init_attr_check) == 0) {
+        fprintf(stderr,
+                "ds4: distributed rdma: QP cap requested send_wr=%d recv_wr=%d got send_wr=%u recv_wr=%u\n",
+                DS4_DIST_RDMA_QP_DEPTH, DS4_DIST_RDMA_QP_DEPTH,
+                qp_attr.cap.max_send_wr, qp_attr.cap.max_recv_wr);
         if (qp_attr.cap.max_send_wr < DS4_DIST_RDMA_QP_DEPTH ||
             qp_attr.cap.max_recv_wr < DS4_DIST_RDMA_QP_DEPTH) {
             fprintf(stderr,
-                    "ds4: distributed rdma: warning: QP capabilities adjusted by hardware: "
-                    "max_send_wr=%u max_recv_wr=%u (requested %d)\n",
-                    qp_attr.cap.max_send_wr, qp_attr.cap.max_recv_wr,
-                    DS4_DIST_RDMA_QP_DEPTH);
+                    "ds4: distributed rdma: WARNING: QP capabilities adjusted by hardware\n");
         }
+    } else {
+        fprintf(stderr, "ds4: distributed rdma: ibv_query_qp failed (not fatal)\n");
     }
 
     /* Transition to INIT */
@@ -477,22 +479,28 @@ static int rdma_send_frame(ds4_dist_rdma_ctx *r, uint32_t type,
                            const void *body, uint32_t body_bytes,
                            char *err, size_t errlen) {
     uint32_t total = DS4_DIST_TRANSPORT_HEADER_BYTES + body_bytes;
-    fprintf(stderr, "ds4: distributed rdma debug: send type=%u body=%u total=%u cap=%zu\n",
-            type, body_bytes, total, r->send_cap);
-    if (total > r->send_cap) {
-        if (errlen) snprintf(err, errlen, "RDMA frame %u exceeds send buffer %zu", total, r->send_cap);
+    /* Round up to 4K frame boundary — TB5 hardware requires frame-aligned SGE */
+    uint32_t aligned = (total + 4095u) & ~4095u;
+    if (aligned > r->send_cap) {
+        if (errlen) snprintf(err, errlen, "RDMA frame %u (%u aligned) exceeds send buffer %zu",
+                             total, aligned, r->send_cap);
         return -1;
     }
+    fprintf(stderr, "ds4: distributed rdma debug: send type=%u body=%u total=%u aligned=%u cap=%zu\n",
+            type, body_bytes, total, aligned, r->send_cap);
 
     ds4_dist_transport_header *hdr = (ds4_dist_transport_header *)r->send_ptr;
     encode_header(hdr, type, body_bytes);
     if (body_bytes > 0)
         memcpy((char *)r->send_ptr + DS4_DIST_TRANSPORT_HEADER_BYTES, body, body_bytes);
+    /* Zero-pad to frame boundary */
+    if (aligned > total)
+        memset((char *)r->send_ptr + total, 0, aligned - total);
 
     struct ibv_sge sge;
     memset(&sge, 0, sizeof(sge));
     sge.addr = (uintptr_t)r->send_ptr;
-    sge.length = total;
+    sge.length = aligned;
     sge.lkey = r->mr->lkey;
 
     struct ibv_send_wr wr;
@@ -518,8 +526,10 @@ static int rdma_send_frame2(ds4_dist_rdma_ctx *r, uint32_t type,
                             const void *body2, uint32_t body2_bytes,
                             char *err, size_t errlen) {
     uint32_t total = DS4_DIST_TRANSPORT_HEADER_BYTES + body1_bytes + body2_bytes;
-    if (total > r->send_cap) {
-        if (errlen) snprintf(err, errlen, "RDMA frame %u exceeds send buffer %zu", total, r->send_cap);
+    uint32_t aligned = (total + 4095u) & ~4095u;
+    if (aligned > r->send_cap) {
+        if (errlen) snprintf(err, errlen, "RDMA frame %u (%u aligned) exceeds send buffer %zu",
+                             total, aligned, r->send_cap);
         return -1;
     }
 
@@ -529,11 +539,14 @@ static int rdma_send_frame2(ds4_dist_rdma_ctx *r, uint32_t type,
     p += DS4_DIST_TRANSPORT_HEADER_BYTES;
     if (body1_bytes > 0) { memcpy(p, body1, body1_bytes); p += body1_bytes; }
     if (body2_bytes > 0) { memcpy(p, body2, body2_bytes); }
+    /* Zero-pad to frame boundary */
+    uint32_t used = DS4_DIST_TRANSPORT_HEADER_BYTES + body1_bytes + body2_bytes;
+    if (aligned > used) memset(r->send_ptr + used, 0, aligned - used);
 
     struct ibv_sge sge;
     memset(&sge, 0, sizeof(sge));
     sge.addr = (uintptr_t)r->send_ptr;
-    sge.length = total;
+    sge.length = aligned;
     sge.lkey = r->mr->lkey;
 
     struct ibv_send_wr wr;
