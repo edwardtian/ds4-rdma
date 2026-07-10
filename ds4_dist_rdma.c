@@ -292,7 +292,7 @@ static ds4_dist_rdma_ctx *rdma_ctx_create(const char *device_name, char *err, si
     }
     r->local.lid = port_attr.lid;
     union ibv_gid gid;
-    if (ibv_query_gid(ctx, 1, 0, &gid) != 0) {
+    if (ibv_query_gid(ctx, 1, 1, &gid) != 0) {
         if (errlen) snprintf(err, errlen, "ibv_query_gid failed");
         goto fail;
     }
@@ -329,8 +329,13 @@ static int rdma_qp_connect(ds4_dist_rdma_ctx *r, const ds4_dist_rdma_dest *peer,
     rtr_attr.ah_attr.port_num = 1;
     rtr_attr.ah_attr.is_global = 1;
     rtr_attr.ah_attr.grh.hop_limit = 1;
-    rtr_attr.ah_attr.grh.sgid_index = 0;
+    rtr_attr.ah_attr.grh.sgid_index = 1;
     memcpy(&rtr_attr.ah_attr.grh.dgid, peer->gid, 16);
+
+    fprintf(stderr, "ds4: distributed rdma: RTR dlid=%u dest_qpn=%u rq_psn=%u port=%u is_global=%d sgid_idx=%u\n",
+            rtr_attr.ah_attr.dlid, rtr_attr.dest_qp_num, rtr_attr.rq_psn,
+            rtr_attr.ah_attr.port_num, rtr_attr.ah_attr.is_global,
+            rtr_attr.ah_attr.grh.sgid_index);
 
     if (ibv_modify_qp(r->qp, &rtr_attr,
                       IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
