@@ -479,7 +479,8 @@ static int rdma_send_frame(ds4_dist_rdma_ctx *r, uint32_t type,
                            const void *body, uint32_t body_bytes,
                            char *err, size_t errlen) {
     uint32_t total = DS4_DIST_TRANSPORT_HEADER_BYTES + body_bytes;
-    if (total > r->send_cap) {
+    uint32_t aligned = r->send_cap;
+    if (total > aligned) {
         if (errlen) snprintf(err, errlen, "RDMA frame %u exceeds send buffer %zu", total, r->send_cap);
         return -1;
     }
@@ -490,11 +491,13 @@ static int rdma_send_frame(ds4_dist_rdma_ctx *r, uint32_t type,
     encode_header(hdr, type, body_bytes);
     if (body_bytes > 0)
         memcpy((char *)r->send_ptr + DS4_DIST_TRANSPORT_HEADER_BYTES, body, body_bytes);
+    if (aligned > total)
+        memset((char *)r->send_ptr + total, 0, aligned - total);
 
     struct ibv_sge sge;
     memset(&sge, 0, sizeof(sge));
     sge.addr = (uintptr_t)r->send_ptr;
-    sge.length = total;
+    sge.length = aligned;
     sge.lkey = r->mr->lkey;
 
     struct ibv_send_wr wr;
@@ -520,7 +523,8 @@ static int rdma_send_frame2(ds4_dist_rdma_ctx *r, uint32_t type,
                             const void *body2, uint32_t body2_bytes,
                             char *err, size_t errlen) {
     uint32_t total = DS4_DIST_TRANSPORT_HEADER_BYTES + body1_bytes + body2_bytes;
-    if (total > r->send_cap) {
+    uint32_t aligned = r->send_cap;
+    if (total > aligned) {
         if (errlen) snprintf(err, errlen, "RDMA frame %u exceeds send buffer %zu", total, r->send_cap);
         return -1;
     }
@@ -531,11 +535,13 @@ static int rdma_send_frame2(ds4_dist_rdma_ctx *r, uint32_t type,
     p += DS4_DIST_TRANSPORT_HEADER_BYTES;
     if (body1_bytes > 0) { memcpy(p, body1, body1_bytes); p += body1_bytes; }
     if (body2_bytes > 0) { memcpy(p, body2, body2_bytes); }
+    uint32_t used = DS4_DIST_TRANSPORT_HEADER_BYTES + body1_bytes + body2_bytes;
+    if (aligned > used) memset(r->send_ptr + used, 0, aligned - used);
 
     struct ibv_sge sge;
     memset(&sge, 0, sizeof(sge));
     sge.addr = (uintptr_t)r->send_ptr;
-    sge.length = total;
+    sge.length = aligned;
     sge.lkey = r->mr->lkey;
 
     struct ibv_send_wr wr;
