@@ -479,28 +479,22 @@ static int rdma_send_frame(ds4_dist_rdma_ctx *r, uint32_t type,
                            const void *body, uint32_t body_bytes,
                            char *err, size_t errlen) {
     uint32_t total = DS4_DIST_TRANSPORT_HEADER_BYTES + body_bytes;
-    /* Round up to 4K frame boundary — TB5 hardware requires frame-aligned SGE */
-    uint32_t aligned = (total + 4095u) & ~4095u;
-    if (aligned > r->send_cap) {
-        if (errlen) snprintf(err, errlen, "RDMA frame %u (%u aligned) exceeds send buffer %zu",
-                             total, aligned, r->send_cap);
+    if (total > r->send_cap) {
+        if (errlen) snprintf(err, errlen, "RDMA frame %u exceeds send buffer %zu", total, r->send_cap);
         return -1;
     }
-    fprintf(stderr, "ds4: distributed rdma debug: send type=%u body=%u total=%u aligned=%u cap=%zu\n",
-            type, body_bytes, total, aligned, r->send_cap);
+    fprintf(stderr, "ds4: distributed rdma debug: send type=%u body=%u total=%u cap=%zu\n",
+            type, body_bytes, total, r->send_cap);
 
     ds4_dist_transport_header *hdr = (ds4_dist_transport_header *)r->send_ptr;
     encode_header(hdr, type, body_bytes);
     if (body_bytes > 0)
         memcpy((char *)r->send_ptr + DS4_DIST_TRANSPORT_HEADER_BYTES, body, body_bytes);
-    /* Zero-pad to frame boundary */
-    if (aligned > total)
-        memset((char *)r->send_ptr + total, 0, aligned - total);
 
     struct ibv_sge sge;
     memset(&sge, 0, sizeof(sge));
     sge.addr = (uintptr_t)r->send_ptr;
-    sge.length = aligned;
+    sge.length = total;
     sge.lkey = r->mr->lkey;
 
     struct ibv_send_wr wr;
@@ -526,10 +520,8 @@ static int rdma_send_frame2(ds4_dist_rdma_ctx *r, uint32_t type,
                             const void *body2, uint32_t body2_bytes,
                             char *err, size_t errlen) {
     uint32_t total = DS4_DIST_TRANSPORT_HEADER_BYTES + body1_bytes + body2_bytes;
-    uint32_t aligned = (total + 4095u) & ~4095u;
-    if (aligned > r->send_cap) {
-        if (errlen) snprintf(err, errlen, "RDMA frame %u (%u aligned) exceeds send buffer %zu",
-                             total, aligned, r->send_cap);
+    if (total > r->send_cap) {
+        if (errlen) snprintf(err, errlen, "RDMA frame %u exceeds send buffer %zu", total, r->send_cap);
         return -1;
     }
 
@@ -539,14 +531,11 @@ static int rdma_send_frame2(ds4_dist_rdma_ctx *r, uint32_t type,
     p += DS4_DIST_TRANSPORT_HEADER_BYTES;
     if (body1_bytes > 0) { memcpy(p, body1, body1_bytes); p += body1_bytes; }
     if (body2_bytes > 0) { memcpy(p, body2, body2_bytes); }
-    /* Zero-pad to frame boundary */
-    uint32_t used = DS4_DIST_TRANSPORT_HEADER_BYTES + body1_bytes + body2_bytes;
-    if (aligned > used) memset(r->send_ptr + used, 0, aligned - used);
 
     struct ibv_sge sge;
     memset(&sge, 0, sizeof(sge));
     sge.addr = (uintptr_t)r->send_ptr;
-    sge.length = aligned;
+    sge.length = total;
     sge.lkey = r->mr->lkey;
 
     struct ibv_send_wr wr;
