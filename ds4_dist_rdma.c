@@ -831,12 +831,11 @@ int ds4_dist_conn_recv_body(
         if (bytes > available) return -1;
         memcpy(buf, (char *)r->recv_ptr + r->recv_consumed, bytes);
         r->recv_consumed += bytes;
-        if (r->recv_consumed >= r->recv_len) {
-            r->recv_ready = false;
-            /* Re-arm the recv immediately to avoid a race where the sender
-             * sends the next message before we post a fresh recv. */
-            ds4_dist_conn_recv_rearm(c);
-        }
+        /* Mark the frame as fully consumed and re-arm.  The recv buffer may
+         * have padding beyond the actual body — we skip straight to the end. */
+        r->recv_consumed = r->recv_len;
+        r->recv_ready = false;
+        ds4_dist_conn_recv_rearm(c);
         return 1;
     }
 #endif
@@ -855,10 +854,10 @@ int ds4_dist_conn_discard(
         uint32_t available = r->recv_len - r->recv_consumed;
         if (bytes > available) bytes = available;
         r->recv_consumed += bytes;
-        if (r->recv_consumed >= r->recv_len) {
-            r->recv_ready = false;
-            ds4_dist_conn_recv_rearm(c);
-        }
+        /* Skip to end of frame (padding) and re-arm */
+        r->recv_consumed = r->recv_len;
+        r->recv_ready = false;
+        ds4_dist_conn_recv_rearm(c);
         return 1;
     }
 #endif
