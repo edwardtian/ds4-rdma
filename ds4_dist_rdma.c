@@ -368,6 +368,8 @@ static int rdma_handshake(ds4_dist_conn *c, ds4_dist_rdma_ctx *r,
                           char *err, size_t errlen) {
     /* Send our dest (network byte order) */
     ds4_dist_rdma_dest local = r->local;
+    fprintf(stderr, "ds4: distributed rdma: handshake send local_qpn=%u local_psn=%u local_lid=%u\n",
+            r->local.qpn, r->local.psn, r->local.lid);
     local.qpn = htonl(local.qpn);
     local.psn = htonl(local.psn);
     local.lid = htons(local.lid);
@@ -388,6 +390,8 @@ static int rdma_handshake(ds4_dist_conn *c, ds4_dist_rdma_ctx *r,
     peer.qpn = ntohl(peer.qpn);
     peer.psn = ntohl(peer.psn);
     peer.lid = ntohs(peer.lid);
+    fprintf(stderr, "ds4: distributed rdma: handshake recv peer_qpn=%u peer_psn=%u peer_lid=%u\n",
+            peer.qpn, peer.psn, peer.lid);
 
     /* Connect QP */
     if (rdma_qp_connect(r, &peer, err, errlen) != 0) return -1;
